@@ -1,0 +1,9 @@
+fastapi 
+uvicorn 
+yt-dlp 
+openai-whisper
+sentence-transformers 
+faiss-cpu 
+pydantic[dotenv] 
+python-multipart 
+sqlite-utils
