@@ -7,3 +7,6 @@ faiss-cpu
 pydantic[dotenv] 
 python-multipart 
 sqlite-utils
+ultralytics
+opencv-python
+pillow
