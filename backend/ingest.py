@@ -11,7 +11,7 @@ TRANS = os.path.join(DATA, "transcripts")
 os.makedirs(MEDIA, exist_ok=True)
 os.makedirs(TRANS, exist_ok=True)
 
-YT_ID_RE = re.compile(r"?:v=youtu\.be/)([A-Za-z0-9_-]{11})")
+YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 def ytdlp(url: str, out: str):
     subprocess.check_call(["yt-dlp", "-f", "bestaudio/best", "-o", out, url])
@@ -20,7 +20,7 @@ def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])
 
 def transcribe(wav_path: str):
-    model = whisper.load_mode("small") 
+    model = whisper.load_model("small") 
     result = model.transcribe(wav_path, word_timestamps=False)
     segments = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
     return segments
