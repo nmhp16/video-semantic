@@ -106,3 +106,15 @@ def ingest_visual(video_id: str, audio_wav_path: str, every_sec: float = 1.0):
     # Store
     save_visual_index(video_id, embs, rows)
     print(f"INGEST OK: {video_id} | frames={len(frames)}")
+
+if __name__ == "__main__":
+    import sys, os
+    if len(sys.argv) < 2:
+        print("Usage: ingest_visual.py <video_id> [wav_path] [every_sec]")
+        sys.exit(1)
+
+    video_id = sys.argv[1]
+    audio_wav_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(MEDIA, f"{video_id}.wav")
+    every_sec = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+
+    ingest_visual(video_id, audio_wav_path, every_sec=every_sec)

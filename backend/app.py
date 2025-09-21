@@ -32,7 +32,7 @@ async def search(video_id: str = Query(...), q: str = Query(...), k: int = 5):
         hits.append(SearchHit(start=start, end=end, text=text, score=score))
     return SearchResponse(video_id=video_id, hits=hits)
 
-@app.get("vsearch")
+@app.get("/vsearch")
 async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, filter_objects: str | None = None):  
     try:
         index, rows = load_visual_index(video_id)

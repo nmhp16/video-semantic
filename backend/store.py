@@ -105,7 +105,7 @@ def save_visual_index(video_id: str, embeddings: np.ndarray, chunks: list[dict])
     conn = get_conn()
     conn.executemany(
         "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects) VALUES(?, ?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["frame"], c["objects"]) 
+        [(video_id, i, c["start"], c["end"], c["frame"], json.dumps(c.get("objects", []))) 
         for i, c in enumerate(chunks)]
     )
     conn.commit()
