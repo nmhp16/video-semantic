@@ -5,10 +5,21 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from ultralytics import YOLO
 from store import DATA, save_visual_index
+import re
+from pathlib import Path
+from ingest import extract_audio
 
 MEDIA = os.path.join(DATA, "media")
 FRAMES = os.path.join(DATA, "frames")
 os.makedirs(FRAMES, exist_ok=True)
+
+YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+def ytdlp_video(url: str, out_mp4: str):
+        subprocess.check_call([
+            "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+            "-o", out_mp4, url
+        ])
 
 # --- Frame sampling ---
 def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List[Dict]:
@@ -68,7 +79,24 @@ class YoloDetector:
 
         return labels_per_image
 
-def ingest_visual(video_id: str, audio_wav_path: str, every_sec: float = 1.0):
+def ingest_visual(url_or_path: str, every_sec: float = 1.0):
+    # Resolve video_id
+    m = YT_ID_RE.search(url_or_path)
+    if m:
+        video_id = m.group(1)
+    else:
+        video_id = Path(url_or_path).stem
+
+    # Download or copy
+    if url_or_path.startswith("http"):
+        tmp_media = os.path.join(MEDIA, f"{video_id}.mp4")
+        ytdlp_video(url_or_path, tmp_media)
+        audio_wav_path = os.path.join(MEDIA, f"{video_id}.wav")
+        extract_audio(tmp_media, audio_wav_path)
+    else:
+        audio_wav_path = os.path.join(MEDIA, f"{video_id}.wav")
+        extract_audio(url_or_path, audio_wav_path)
+
     # Find visual container
     base = os.path.splitext(audio_wav_path)[0]
     candidates = [base + ext for ext in (".mp4", ".mkv", ".webm", ".m4a")]
@@ -110,11 +138,10 @@ def ingest_visual(video_id: str, audio_wav_path: str, every_sec: float = 1.0):
 if __name__ == "__main__":
     import sys, os
     if len(sys.argv) < 2:
-        print("Usage: ingest_visual.py <video_id> [wav_path] [every_sec]")
+        print("Usage: ingest_visual.py <url_or_path> [every_sec]")
         sys.exit(1)
 
-    video_id = sys.argv[1]
-    audio_wav_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(MEDIA, f"{video_id}.wav")
+    url_or_path = sys.argv[1]
     every_sec = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
 
-    ingest_visual(video_id, audio_wav_path, every_sec=every_sec)
+    ingest_visual(url_or_path, every_sec=every_sec)
