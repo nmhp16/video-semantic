@@ -2,3 +2,8 @@
 __pycache__/
 .env
 .vscode/
+*.json
+*.wav
+*.mp4
+*.faiss
+*.sqlite

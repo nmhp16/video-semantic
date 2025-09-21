@@ -49,7 +49,7 @@ def load_index(video_id: str):
     rows = conn.execute("""
         SELECT idx, start, end, text 
         FROM chunks 
-        WHERE video_id=?"
+        WHERE video_id=?
         ORDER BY idx
     """, (video_id,)).fetchall()
     conn.close()

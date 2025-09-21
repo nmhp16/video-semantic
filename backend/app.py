@@ -24,7 +24,7 @@ async def search(video_id: str = Query(...), q: str = Query(...), k: int = 5):
     qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
     D, I = index.search(qv, k)
     hits = []
-    for score, idx in zip(d[0].tolist(), I[0].tolist()):
+    for score, idx in zip(D[0].tolist(), I[0].tolist()):
         if idx == -1:
             continue
         _, start, end, text = rows[idx]
