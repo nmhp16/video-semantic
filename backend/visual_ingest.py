@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from ultralytics import YOLO
-from store import DATA, save_visual_index
+from store import DATA, save_visual_index, save_action_clips_index, append_global_action_index
 import re
 from pathlib import Path
 from ingest import extract_audio
@@ -79,6 +79,37 @@ class YoloDetector:
 
         return labels_per_image
 
+def build_clip_windows(frames, embs, labels, clip_len=2.0, stride=0.5):
+    i, N = 0, len(frames)
+    clip_vecs, rows = [], []
+    while i < N:
+        t0 = frames[i]["t"]
+        # Collect [t0, t0 + clip_len]
+        idxs = []
+        j = i
+        while j < N and frames[j]["t"] <= t0 + clip_len:
+            idxs.append(j) 
+            j += 1
+        if idxs:
+            V = embs[idxs]
+            v = V.mean(axis=0)
+            v /= (np.linalg.norm(v) + 1e-12)
+            objs = set()
+            for k in idxs:
+                for o in labels[k]:
+                    objs.add(o)
+            clip_vecs.append(v)
+            rows.append({
+                "start": float(frames[idxs[0]]["t"]),
+                "end":   float(frames[idxs[-1]]["t_end"]),
+                "objects": sorted(list(objs))
+            })
+        # Stride
+        t_next = t0 + stride
+        while i < N and frames[i]["t"] < t_next:
+            i += 1
+    return np.stack(clip_vecs, axis=0).astype("float32"), rows
+
 def ingest_visual(url_or_path: str, every_sec: float = 1.0):
     # Resolve video_id
     m = YT_ID_RE.search(url_or_path)
@@ -120,6 +151,10 @@ def ingest_visual(url_or_path: str, every_sec: float = 1.0):
     # Objects
     det = YoloDetector("yolov8n.pt")
     labels = det.detect_labels([f["path"] for f in frames])
+    clip_vecs, clip_rows = build_clip_windows(frames, embs, labels, clip_len=2.0, stride=0.5)
+    save_action_clips_index(video_id, clip_vecs, clip_rows)
+    append_global_action_index(video_id, clip_vecs)
+    print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
 
     # Rows for DB
     rows = []
