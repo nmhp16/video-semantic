@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from ultralytics import YOLO
-from store import DATA, save_visual_index, save_action_clips_index, append_global_action_index
+from store import DATA, save_visual_index, save_action_clips_index
 import re
 from pathlib import Path
 from ingest import extract_audio
@@ -153,7 +153,6 @@ def ingest_visual(url_or_path: str, every_sec: float = 1.0):
     labels = det.detect_labels([f["path"] for f in frames])
     clip_vecs, clip_rows = build_clip_windows(frames, embs, labels, clip_len=2.0, stride=0.5)
     save_action_clips_index(video_id, clip_vecs, clip_rows)
-    append_global_action_index(video_id, clip_vecs)
     print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
 
     # Rows for DB
