@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import numpy as np, json
 from sentence_transformers import SentenceTransformer
 import faiss
-from store import load_index, load_global_action_index, unpack_gid, video_id_from_crc, get_conn, load_visual_index, load_action_clips_index
+from store import load_index, load_global_action_index, unpack_gid, video_id_from_crc, get_conn, load_visual_index, load_action_clips_index, rebuild_global_action_index, get_global_index_stats
 from models import SearchResponse, SearchHit
 from typing import List
 
@@ -117,37 +117,58 @@ def fetch_clip_row(video_id: str, clip_idx: int):
     return row
 
 def search_action_global(q: str, k: int, filter_objects: str | None = None, restrict_videos: list[str] | None = None):
-    # Encode prompt
-    qv = encode_prompt_set(CLIP_TXT, expand_prompt(q)).astype("float32")
-
-    # Search global FAISS
-    index = load_global_action_index()
-    D, I = index.search(qv, k)  # I are gids
-    hits = []
-    for score, gid in zip(D[0].tolist(), I[0].tolist()):
-        if gid == -1: continue
-        crc, clip_idx = unpack_gid(int(gid))
-        video_id = video_id_from_crc(crc)
-        if not video_id: continue
-        if restrict_videos and video_id not in restrict_videos:
-            continue
-        row = fetch_clip_row(video_id, int(clip_idx))
-        if not row: continue
-        _, start, end, objects_json = row
-        import json
-        objs = json.loads(objects_json) if objects_json else []
-        if filter_objects and (filter_objects not in objs):
-            continue
-        hits.append({
-            "video_id": video_id,
-            "start": float(start),
-            "end": float(end),
-            "objects": objs,
-            "score": float(score),
-        })
-    # sort by score desc
-    hits.sort(key=lambda h: h["score"], reverse=True)
-    return hits
+    """
+    Search across all videos' action clips using a safe approach that avoids segmentation faults.
+    """
+    try:
+        print(f"[DEBUG] Starting search_action_global: q='{q}', k={k}, filter_objects={filter_objects}")
+        
+        # Instead of using the problematic global index, search individual video indexes
+        # This is slower but more stable
+        all_hits = []
+        
+        # Get all videos that have action indexes
+        import os
+        index_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
+        video_ids = []
+        
+        for filename in os.listdir(index_dir):
+            if filename.endswith('.aclip.faiss') and not filename.startswith('_global'):
+                video_id = filename.replace('.aclip.faiss', '')
+                if not restrict_videos or video_id in restrict_videos:
+                    video_ids.append(video_id)
+        
+        print(f"[DEBUG] Found {len(video_ids)} videos with action indexes: {video_ids}")
+        
+        # Search each video individually
+        for video_id in video_ids:
+            try:
+                print(f"[DEBUG] Searching video {video_id}...")
+                hits = search_action_clips(video_id, q, k, filter_objects)
+                
+                # Add video_id to each hit and collect
+                for hit in hits:
+                    hit['video_id'] = video_id
+                    all_hits.append(hit)
+                    
+                print(f"[DEBUG] Found {len(hits)} hits from {video_id}")
+                
+            except Exception as e:
+                print(f"[WARNING] Error searching video {video_id}: {e}")
+                continue
+        
+        # Sort all hits by score (descending) and take top k
+        all_hits.sort(key=lambda h: h["score"], reverse=True)
+        final_hits = all_hits[:k]
+        
+        print(f"[DEBUG] Total hits found: {len(all_hits)}, returning top {len(final_hits)}")
+        return final_hits
+        
+    except Exception as e:
+        print(f"[ERROR] Exception in search_action_global: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
 
 @app.get("/vsearch")
 async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, filter_objects: str | None = None):  
@@ -221,6 +242,22 @@ def asearch_all(
 ):
     try:
         hits = search_action_global(q, k, filter_objects=filter_objects, restrict_videos=videos)
+        return {"query": q, "hits": hits[:k]}
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Global index missing or query error: {e}")
-    return {"query": q, "hits": hits[:k]}
+        print(f"ERROR in /asearch_all: {e}")
+        raise HTTPException(status_code=500, detail=f"Global search error: {e}")
+
+@app.get("/global_index_stats")
+def global_index_stats():
+    """Get statistics about the global action index."""
+    return get_global_index_stats()
+
+@app.post("/rebuild_global_index")
+def rebuild_global_index():
+    """Rebuild the global action index from all existing video indexes."""
+    try:
+        total_clips = rebuild_global_action_index()
+        return {"success": True, "total_clips_indexed": total_clips, "message": "Global index rebuilt successfully"}
+    except Exception as e:
+        print(f"ERROR rebuilding global index: {e}")
+        raise HTTPException(status_code=500, detail=f"Rebuild failed: {e}")
