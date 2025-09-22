@@ -22,7 +22,8 @@ class VideoIngestRequest(BaseModel):
 
 MODE = Literal["text", "visual", "action", "action_chain"]
 class UnifiedSearchRequest(BaseModel):
-    video_url: str
+    video_url: Optional[str] = None
+    video_id: Optional[str] = None
     query: Optional[str] = None
     mode: MODE
     k: int = 10
@@ -31,6 +32,8 @@ class UnifiedSearchRequest(BaseModel):
     steps: Optional[List[str]] = None
     max_gap: float = 8.0
     ingest_if_needed: bool = True
+    scope: str = "video"
+    videos: Optional[List[str]] = None
 
 class UnifiedSearchHit(BaseModel):
     start: float
@@ -42,7 +45,7 @@ class UnifiedSearchHit(BaseModel):
     video_id: str
 
 class UnifiedSearchResponse(BaseModel):
-    video_id: str
+    video_id: Optional[str] = None
     mode: MODE
     hits: List[UnifiedSearchHit] = Field(default_factory=list)
     info: dict = Field(default_factory=dict)   # extra info (e.g., chosen path for action_chain)

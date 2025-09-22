@@ -18,15 +18,6 @@ VINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.vfaiss")
 # Action index paths
 ACLIP_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.aclip.faiss")
 
-def _safe_l2norm(x: np.ndarray) -> np.ndarray:
-    """Safely normalize embeddings to unit length."""
-    x = x.astype("float32", copy=False)
-    norms = np.linalg.norm(x, axis=1, keepdims=True)
-    x = x / (norms + 1e-12)
-    if not np.isfinite(x).all():
-        raise ValueError("Non-finite values in embeddings after normalization")
-    return x
-
 # --- SQLite helpers ---
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -51,7 +42,8 @@ def get_conn():
             start REAL,
             end REAL,
             frame TEXT,
-            objects TEXT
+            objects TEXT,
+            UNIQUE(video_id, idx) ON CONFLICT REPLACE
         )             
     """)
 
@@ -61,7 +53,8 @@ def get_conn():
             idx INTEGER,
             start REAL,
             end REAL,
-            objects TEXT
+            objects TEXT,
+            UNIQUE(video_id, idx) ON CONFLICT REPLACE
         )
     """)
     return conn
@@ -156,7 +149,7 @@ def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list[di
             os.remove(ACLIP_PATH(video_id))
 
     index = faiss.IndexFlatIP(d)
-    vecs = _safe_l2norm(embeddings)
+    vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
     index.add(vecs.astype('float32'))
     faiss.write_index(index, ACLIP_PATH(video_id))
 
