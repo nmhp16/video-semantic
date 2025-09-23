@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, json, os
 from sentence_transformers import SentenceTransformer
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from store import (
     load_index, get_conn, load_visual_index, load_action_clips_index,
 )
@@ -12,6 +12,7 @@ from models import (
 )
 from utils_unified import extract_video_id
 from gdino import detect_on_image
+from gdino_helper import rerank_with_gdino
 
 app = FastAPI()
 app.add_middleware(
@@ -150,6 +151,43 @@ def chain_actions(video_id: str, steps: list[str], k_per_step=40, max_gap=8.0, f
     chosen = full[0] if full else (paths[0] if paths else [])
     return chosen, cand
 
+def representative_frame_for_segment(video_id: str, seg_start: float, seg_end: float) -> Optional[str]:
+    mid = 0.5 * (float(seg_start) + float(seg_end))
+    conn = get_conn()
+
+    # Exact containment of midpoint
+    row = conn.execute("""
+        SELECT frame, start, end
+        FROM visual_chunks
+        WHERE video_id=? AND start <= ? AND end >= ?
+        ORDER BY ABS((start+end)/2.0 - ?) ASC
+        LIMIT 1
+    """, (video_id, mid, mid, mid)).fetchone()
+
+    if not row:
+        # Any overlap, closest to midpoint
+        row = conn.execute("""
+            SELECT frame, start, end
+            FROM visual_chunks
+            WHERE video_id=? AND end >= ? AND start <= ?
+            ORDER BY 
+              CASE 
+                WHEN ? BETWEEN start AND end THEN 0 
+                ELSE MIN(ABS(start-?), ABS(end-?)) 
+              END ASC
+            LIMIT 1
+        """, (video_id, seg_start, seg_end, mid, mid, mid)).fetchone()
+    
+    conn.close()
+    if row:
+        return row[0]
+    else:
+        return None
+    
+def action_frame_resolver(hit: Dict[str, Any]) -> Optional[str]:
+    if hit.get("frame"):
+        return hit["frame"]
+    return representative_frame_for_segment(hit["video_id"], hit["start"], hit["end"])
 # --------------------
 # per-video + global helpers
 # --------------------
@@ -435,101 +473,6 @@ async def ingest_video(request: VideoIngestRequest):
         print(f"Ingestion error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
-# --------------------
-# Unified /query with scope switch
-# --------------------
-@app.post("/query", response_model=UnifiedSearchResponse)
-def unified_query(body: UnifiedSearchRequest):
-    scope = (body.scope or "video").lower()
-    restrict = body.videos
-
-    # ==== scope = video (existing behavior) ====
-    if scope == "video":
-        vid = body.video_id or extract_video_id(body.video_url or "")
-        if not vid:
-            raise HTTPException(400, "video_id or video_url is required for scope='video'")
-
-        need_text   = body.mode == "text"
-        need_visual = body.mode == "visual"
-        need_action = body.mode in ("action", "action_chain")
-
-        if body.ingest_if_needed and not have_indexes(vid, need_text, need_visual, need_action):
-            ensure_ingested(body.video_url or "", vid, need_text, need_visual, need_action)
-
-        if body.mode == "text":
-            raw = search_text_single(vid, body.query or "", body.k)
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     text=h["text"], video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=vid, mode="text", hits=hits)
-
-        if body.mode == "visual":
-            raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = dedupe_hits(raw, key_mode="auto")
-            raw = nms_time(raw, tol=0.5)
-            if body.k:
-                raw = raw[:body.k]
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     frame=h["frame"], objects=h.get("objects"),
-                                     video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=vid, mode="visual", hits=hits)
-
-        if body.mode == "action":
-            raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = dedupe_hits(raw, key_mode="time")
-            raw = nms_time(raw, tol=0.5)
-            if body.k:
-                raw = raw[:body.k]
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     objects=h.get("objects"), video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=vid, mode="action", hits=hits)
-
-        if body.mode == "action_chain":
-            if not body.steps:
-                raise HTTPException(400, "steps is required for mode=action_chain")
-            path, cand = chain_actions(vid, body.steps, k_per_step=body.k,
-                                       max_gap=body.max_gap,
-                                       filter_objects=body.filter_objects)
-            path = dedupe_hits(path, key_mode="time")
-            path = nms_time(path, tol=0.5)
-            if body.k:
-                path = path[:body.k]
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     objects=h.get("objects"), video_id=vid) for h in path]
-            return UnifiedSearchResponse(video_id=vid, mode="action_chain", hits=hits,
-                                         info={"steps": body.steps,
-                                               "preview_per_step": [c[:5] for c in cand]})
-        raise HTTPException(400, f"Unknown mode {body.mode}")
-
-    # ==== scope = global  ====
-    if scope == "global":
-        if body.mode == "text":
-            raw = search_text_global(body.query or "", body.k, restrict_videos=restrict)
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     text=h["text"], video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=None, mode="text", hits=hits)
-
-        if body.mode == "visual":
-            raw = search_visual_global(body.query or "", body.k,
-                                       filter_objects=body.filter_objects,
-                                       restrict_videos=restrict)
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     frame=h.get("frame"), objects=h.get("objects"),
-                                     video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=None, mode="visual", hits=hits)
-
-        if body.mode == "action":
-            raw = search_action_global(body.query or "", body.k,
-                                       filter_objects=body.filter_objects,
-                                       restrict_videos=restrict)
-            hits = [UnifiedSearchHit(start=h["start"], end=h["end"], score=h["score"],
-                                     objects=h.get("objects"), video_id=h["video_id"]) for h in raw]
-            return UnifiedSearchResponse(video_id=None, mode="action", hits=hits)
-
-        # (Optional) global action_chain could run per-video and pick best; not supported here.
-        raise HTTPException(400, "action_chain not supported with scope='global'")
-
-    raise HTTPException(400, f"Unknown scope {scope}")
-
 @app.post("/ov_verify")
 def ov_verify(req: OVVerifyRequest):
     out = {}
@@ -545,3 +488,316 @@ def ov_verify(req: OVVerifyRequest):
         except Exception as e:
             out[f] = {"detections": [], "debug": {"error": str(e)}}
     return {"results": out}
+
+# --------------------
+# Unified /query with scope switch
+# --------------------
+@app.post("/query", response_model=UnifiedSearchResponse)
+def unified_query(body: UnifiedSearchRequest):
+    scope = (body.scope or "video").lower()
+    restrict = body.videos
+
+    # ==== scope = video ====
+    if scope == "video":
+        vid = body.video_id or extract_video_id(body.video_url or "")
+        if not vid:
+            raise HTTPException(400, "video_id or video_url is required for scope='video'")
+
+        need_text   = body.mode == "text"
+        need_visual = body.mode == "visual"
+        need_action = body.mode in ("action", "action_chain")
+
+        if body.ingest_if_needed and not have_indexes(vid, need_text, need_visual, need_action):
+            ensure_ingested(body.video_url or "", vid, need_text, need_visual, need_action)
+
+        # ---- TEXT ----
+        if body.mode == "text":
+            raw = search_text_single(vid, body.query or "", body.k)
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h["score"]),
+                text=h["text"],
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=vid, mode="text", hits=hits)
+
+        # ---- VISUAL (frame-level) ----
+        if body.mode == "visual":
+            raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
+            raw = dedupe_hits(raw, key_mode="auto")
+            raw = nms_time(raw, tol=0.5)
+
+            if getattr(body, "verify_with_gdino", False):
+                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
+                cand_hits = raw[:topk]
+                prompts = body.verify_prompts or []
+                require = body.verify_require_all or []
+                if prompts:
+                    cand_hits = rerank_with_gdino(
+                        cand_hits,
+                        prompts=prompts,
+                        require_all=require,
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        w_clip=0.6, w_gdino=0.4
+                    )
+                    raw = cand_hits + raw[topk:]
+
+            if body.k:
+                raw = raw[:body.k]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h["frame"],
+                objects=h.get("objects"),
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=vid, mode="visual", hits=hits)
+
+        # ---- ACTION (segment-level) ----
+        if body.mode == "action":
+            raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
+            raw = dedupe_hits(raw, key_mode="time")
+            raw = nms_time(raw, tol=0.5)
+
+            if getattr(body, "verify_with_gdino", False) and raw:
+                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
+                cand_hits = raw[:topk]
+                prompts = body.verify_prompts or []
+                require = body.verify_require_all or []
+                if prompts:
+                    cand_hits = rerank_with_gdino(
+                        cand_hits,
+                        prompts=prompts,
+                        require_all=require,
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        w_clip=0.6, w_gdino=0.4,
+                        frame_resolver=action_frame_resolver
+                    )
+                    raw = cand_hits + raw[topk:]
+
+            if body.k:
+                raw = raw[:body.k]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h.get("frame"),          # may be None; GDINO used resolver
+                objects=h.get("objects"),
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=vid, mode="action", hits=hits)
+
+        # ---- ACTION CHAIN (within a single video) ----
+        if body.mode == "action_chain":
+            if not body.steps:
+                raise HTTPException(400, "steps is required for mode=action_chain")
+
+            path_hits, cand_per_step = chain_actions(
+                vid, body.steps, k_per_step=body.k,
+                max_gap=body.max_gap, filter_objects=body.filter_objects
+            )
+            path_hits = dedupe_hits(path_hits, key_mode="time")
+            path_hits = nms_time(path_hits, tol=0.5)
+
+            if getattr(body, "verify_with_gdino", False) and path_hits:
+                topk = min(getattr(body, "verify_topk", 30) or 30, len(path_hits))
+                cand_hits = path_hits[:topk]
+                prompts = body.verify_prompts or []
+                require = body.verify_require_all or []
+                if prompts:
+                    cand_hits = rerank_with_gdino(
+                        cand_hits,
+                        prompts=prompts,
+                        require_all=require,
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        w_clip=0.6, w_gdino=0.4,
+                        frame_resolver=action_frame_resolver
+                    )
+                    path_hits = cand_hits + path_hits[topk:]
+
+            if body.k:
+                path_hits = path_hits[:body.k]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h.get("frame"),
+                objects=h.get("objects"),
+                video_id=vid
+            ) for h in path_hits]
+
+            return UnifiedSearchResponse(
+                video_id=vid, mode="action_chain", hits=hits,
+                info={"steps": body.steps, "preview_per_step": [c[:5] for c in cand_per_step]}
+            )
+
+        raise HTTPException(400, f"Unknown mode {body.mode}")
+
+    # ==== scope = global ====
+    if scope == "global":
+        # ---- TEXT ----
+        if body.mode == "text":
+            raw = search_text_global(body.query or "", body.k, restrict_videos=restrict)
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h["score"]),
+                text=h["text"],
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=None, mode="text", hits=hits)
+
+        # ---- VISUAL (frame-level) ----
+        if body.mode == "visual":
+            raw = search_visual_global(
+                body.query or "", body.k,
+                filter_objects=body.filter_objects,
+                restrict_videos=restrict
+            )
+
+            if getattr(body, "verify_with_gdino", False) and raw:
+                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
+                cand_hits = raw[:topk]
+                prompts = body.verify_prompts or []
+                require = body.verify_require_all or []
+                if prompts:
+                    cand_hits = rerank_with_gdino(
+                        cand_hits,
+                        prompts=prompts,
+                        require_all=require,
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        w_clip=0.6, w_gdino=0.4
+                    )
+                    raw = cand_hits + raw[topk:]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h.get("frame"),
+                objects=h.get("objects"),
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=None, mode="visual", hits=hits)
+
+        # ---- ACTION (segment-level) ----
+        if body.mode == "action":
+            raw = search_action_global(
+                body.query or "", body.k,
+                filter_objects=body.filter_objects,
+                restrict_videos=restrict
+            )
+
+            if getattr(body, "verify_with_gdino", False) and raw:
+                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
+                cand_hits = raw[:topk]
+                prompts = body.verify_prompts or []
+                require = body.verify_require_all or []
+                if prompts:
+                    cand_hits = rerank_with_gdino(
+                        cand_hits,
+                        prompts=prompts,
+                        require_all=require,
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        w_clip=0.6, w_gdino=0.4,
+                        frame_resolver=action_frame_resolver
+                    )
+                    raw = cand_hits + raw[topk:]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h.get("frame"),
+                objects=h.get("objects"),
+                video_id=h["video_id"]
+            ) for h in raw]
+            return UnifiedSearchResponse(video_id=None, mode="action", hits=hits)
+
+        # ---- ACTION CHAIN (global: per-video chain, pick best) ----
+        if body.mode == "action_chain":
+            if not body.steps:
+                raise HTTPException(400, "steps is required for mode=action_chain")
+
+            vids = _globally(".aclip.faiss", restrict)
+            per_video = []  # (video_id, path_hits, cand_per_step, total_score)
+
+            for vid in vids:
+                try:
+                    path_hits, cand_per_step = chain_actions(
+                        vid, body.steps, k_per_step=body.k,
+                        max_gap=body.max_gap, filter_objects=body.filter_objects
+                    )
+                    path_hits = dedupe_hits(path_hits, key_mode="time")
+                    path_hits = nms_time(path_hits, tol=0.5)
+
+                    if getattr(body, "verify_with_gdino", False) and path_hits:
+                        topk = min(getattr(body, "verify_topk", 30) or 30, len(path_hits))
+                        cand_hits = path_hits[:topk]
+                        prompts = body.verify_prompts or []
+                        require = body.verify_require_all or []
+                        if prompts:
+                            cand_hits = rerank_with_gdino(
+                                cand_hits,
+                                prompts=prompts,
+                                require_all=require,
+                                box_th=body.verify_box_threshold,
+                                text_th=body.verify_text_threshold,
+                                w_clip=0.6, w_gdino=0.4,
+                                frame_resolver=action_frame_resolver
+                            )
+                            path_hits = cand_hits + path_hits[topk:]
+
+                    # score the path (prefer fused)
+                    def seg_score(h): return float(h.get("score_fused", h.get("score", 0.0)))
+                    total = sum(seg_score(h) for h in path_hits)
+                    per_video.append((vid, path_hits, cand_per_step, total))
+                except Exception:
+                    continue  # skip videos without indexes or failing chain
+
+            if not per_video:
+                return UnifiedSearchResponse(
+                    video_id=None, mode="action_chain", hits=[],
+                    info={"steps": body.steps}
+                )
+
+            per_video.sort(key=lambda x: x[3], reverse=True)
+            best_vid, best_path, best_cands, _ = per_video[0]
+
+            if body.k:
+                best_path = best_path[:body.k]
+
+            hits = [UnifiedSearchHit(
+                start=h["start"],
+                end=h["end"],
+                score=float(h.get("score_fused", h["score"])),
+                frame=h.get("frame"),
+                objects=h.get("objects"),
+                video_id=best_vid
+            ) for h in best_path]
+
+            return UnifiedSearchResponse(
+                video_id=best_vid,
+                mode="action_chain",
+                hits=hits,
+                info={
+                    "steps": body.steps,
+                    "selected_video": best_vid,
+                    "preview_per_step": [c[:5] for c in best_cands]
+                }
+            )
+
+        raise HTTPException(400, "Unknown or unsupported mode for scope='global'")
+
+    raise HTTPException(400, f"Unknown scope {scope}")
+

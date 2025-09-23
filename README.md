@@ -37,6 +37,9 @@ curl -X POST http://127.0.0.1:8000/query \
     "mode":"visual",
     "query":"chef chopping meat on a board",
     "filter_objects":"person",
+    "verify_with_gdino": true,
+    "verify_prompts": ["chef","knife","cutting board"],
+    "verify_require_all": ["knife","cutting board"],
     "k":12
   }'
 ```
@@ -51,6 +54,9 @@ curl -X POST http://127.0.0.1:8000/query \
     "mode":"action",
     "query":"chopping meat",
     "filter_objects":"person",
+    "verify_with_gdino": true,
+    "verify_prompts": ["chef","knife","cutting board"],
+    "verify_require_all": ["knife","cutting board"],
     "k":40
   }'
 ```
@@ -66,7 +72,10 @@ curl -X POST http://127.0.0.1:8000/query \
     "steps":["open fridge","take meat","chop meat"],
     "k":50,
     "max_gap":8.0,
-    "filter_objects":"person"
+    "filter_objects":"person",
+    "verify_with_gdino": true,
+    "verify_prompts": ["chef","knife","cutting board"],
+    "verify_require_all": ["knife","cutting board"],
   }'
 ```
 
@@ -77,27 +86,14 @@ curl -X POST http://127.0.0.1:8000/query \
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
   -d '{
-    "video_url":"https://youtu.be/zPxQjuFoUBc",
     "scope":"global",
     "mode":"action",
     "query":"chopping meat",
     "filter_objects":"person",
+    "verify_with_gdino": true,
+    "verify_prompts": ["chef","knife","cutting board"],
+    "verify_require_all": ["knife","cutting board"],
     "k":40
-  }'
-```
-
-# Verify action with Grounding Dino
-```
-curl -s -X POST http://127.0.0.1:8000/ov_verify \
-  -H "Content-Type: application/json" \
-  -d '{
-    "frames": [
-      "data/frames/zPxQjuFoUBc/frame-000003.jpg",
-      "data/frames/nP1BzMZR92c/frame-000002.jpg"
-    ],
-    "prompts": ["chef","cutting board","knife"],
-    "box_threshold": 0.3,
-    "text_threshold": 0.3
   }'
 ```
 

@@ -34,6 +34,12 @@ class UnifiedSearchRequest(BaseModel):
     ingest_if_needed: bool = True
     scope: str = "video"
     videos: Optional[List[str]] = None
+    verify_with_gdino: bool = False
+    verify_prompts: Optional[List[str]] = None
+    verify_require_all: Optional[List[str]] = None
+    verify_box_threshold: float = 0.3
+    verify_text_threshold: float = 0.35
+    verify_topk: int = 30
 
 class UnifiedSearchHit(BaseModel):
     start: float
