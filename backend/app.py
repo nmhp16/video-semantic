@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, json, os
 from sentence_transformers import SentenceTransformer
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from store import (
     load_index, get_conn, load_visual_index, load_action_clips_index,
 )
@@ -289,6 +289,54 @@ def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     return all_hits[:k]
 
+# ---- Shared helpers ----
+def _postproc_hits(hits: list[dict], *, key_mode: str, k: int | None) -> list[dict]:
+    hits = dedupe_hits(hits, key_mode=key_mode)
+    hits = nms_time(hits, tol=0.5)
+    if k:
+        hits = hits[:k]
+    return hits
+
+def _maybe_gdino_fuse(
+    hits: list[dict],
+    *,
+    verify_on: bool,
+    prompts: list[str],
+    require_all: list[str],
+    box_th: float | None,
+    text_th: float | None,
+    frame_resolver: Callable[[dict], str | None] | None = None,
+    w_clip: float = 0.6,
+    w_gdino: float = 0.4,
+) -> list[dict]:
+    if not (verify_on and prompts and hits):
+        return hits
+    # use existing helper; just pass through
+    topk = min(30, len(hits))
+    cand = hits[:topk]
+    cand = rerank_with_gdino(
+        cand,
+        prompts=prompts,
+        require_all=require_all or [],
+        box_th=box_th,
+        text_th=text_th,
+        w_clip=w_clip,
+        w_gdino=w_gdino,
+        frame_resolver=frame_resolver,
+    )
+    return cand + hits[topk:]
+
+def _as_unified(h: dict) -> UnifiedSearchHit:
+    return UnifiedSearchHit(
+        start=float(h.get("start", 0.0)),
+        end=float(h.get("end", h.get("start", 0.0))),
+        score=float(h.get("score_fused", h.get("score", 0.0))),
+        frame=h.get("frame"),
+        objects=h.get("objects"),
+        text=h.get("text"),
+        video_id=h.get("video_id"),
+    )
+
 # --------------------
 # Endpoints
 # --------------------
@@ -525,72 +573,36 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
             raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = dedupe_hits(raw, key_mode="auto")
-            raw = nms_time(raw, tol=0.5)
-
-            if getattr(body, "verify_with_gdino", False):
-                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
-                cand_hits = raw[:topk]
-                prompts = body.verify_prompts or []
-                require = body.verify_require_all or []
-                if prompts:
-                    cand_hits = rerank_with_gdino(
-                        cand_hits,
-                        prompts=prompts,
-                        require_all=require,
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        w_clip=0.6, w_gdino=0.4
-                    )
-                    raw = cand_hits + raw[topk:]
-
-            if body.k:
-                raw = raw[:body.k]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h["frame"],
-                objects=h.get("objects"),
-                video_id=h["video_id"]
-            ) for h in raw]
+            raw = _postproc_hits(raw, key_mode="auto", k=None)
+            raw = _maybe_gdino_fuse(
+                raw,
+                verify_on=getattr(body, "verify_with_gdino", False),
+                prompts=body.verify_prompts or [],
+                require_all=body.verify_require_all or [],
+                box_th=body.verify_box_threshold,
+                text_th=body.verify_text_threshold,
+            )
+            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw = _postproc_hits(raw, key_mode="auto", k=body.k)
+            hits = [_as_unified(h) for h in raw]
             return UnifiedSearchResponse(video_id=vid, mode="visual", hits=hits)
 
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
             raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = dedupe_hits(raw, key_mode="time")
-            raw = nms_time(raw, tol=0.5)
-
-            if getattr(body, "verify_with_gdino", False) and raw:
-                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
-                cand_hits = raw[:topk]
-                prompts = body.verify_prompts or []
-                require = body.verify_require_all or []
-                if prompts:
-                    cand_hits = rerank_with_gdino(
-                        cand_hits,
-                        prompts=prompts,
-                        require_all=require,
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        w_clip=0.6, w_gdino=0.4,
-                        frame_resolver=action_frame_resolver
-                    )
-                    raw = cand_hits + raw[topk:]
-
-            if body.k:
-                raw = raw[:body.k]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h.get("frame"),          # may be None; GDINO used resolver
-                objects=h.get("objects"),
-                video_id=h["video_id"]
-            ) for h in raw]
+            raw = _postproc_hits(raw, key_mode="time", k=None)
+            raw = _maybe_gdino_fuse(
+                raw,
+                verify_on=getattr(body, "verify_with_gdino", False),
+                prompts=body.verify_prompts or [],
+                require_all=body.verify_require_all or [],
+                box_th=body.verify_box_threshold,
+                text_th=body.verify_text_threshold,
+                frame_resolver=action_frame_resolver,
+            )
+            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw = _postproc_hits(raw, key_mode="time", k=body.k)
+            hits = [_as_unified(h) for h in raw]
             return UnifiedSearchResponse(video_id=vid, mode="action", hits=hits)
 
         # ---- ACTION CHAIN (within a single video) ----
@@ -602,43 +614,23 @@ def unified_query(body: UnifiedSearchRequest):
                 vid, body.steps, k_per_step=body.k,
                 max_gap=body.max_gap, filter_objects=body.filter_objects
             )
-            path_hits = dedupe_hits(path_hits, key_mode="time")
-            path_hits = nms_time(path_hits, tol=0.5)
-
-            if getattr(body, "verify_with_gdino", False) and path_hits:
-                topk = min(getattr(body, "verify_topk", 30) or 30, len(path_hits))
-                cand_hits = path_hits[:topk]
-                prompts = body.verify_prompts or []
-                require = body.verify_require_all or []
-                if prompts:
-                    cand_hits = rerank_with_gdino(
-                        cand_hits,
-                        prompts=prompts,
-                        require_all=require,
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        w_clip=0.6, w_gdino=0.4,
-                        frame_resolver=action_frame_resolver
-                    )
-                    path_hits = cand_hits + path_hits[topk:]
-
-            if body.k:
-                path_hits = path_hits[:body.k]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h.get("frame"),
-                objects=h.get("objects"),
-                video_id=vid
-            ) for h in path_hits]
-
+            path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
+            path_hits = _maybe_gdino_fuse(
+                path_hits,
+                verify_on=getattr(body, "verify_with_gdino", False),
+                prompts=body.verify_prompts or [],
+                require_all=body.verify_require_all or [],
+                box_th=body.verify_box_threshold,
+                text_th=body.verify_text_threshold,
+                frame_resolver=action_frame_resolver,
+            )
+            path_hits.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            path_hits = _postproc_hits(path_hits, key_mode="time", k=body.k)
+            hits = [_as_unified(h) for h in path_hits]
             return UnifiedSearchResponse(
                 video_id=vid, mode="action_chain", hits=hits,
                 info={"steps": body.steps, "preview_per_step": [c[:5] for c in cand_per_step]}
             )
-
         raise HTTPException(400, f"Unknown mode {body.mode}")
 
     # ==== scope = global ====
@@ -662,31 +654,18 @@ def unified_query(body: UnifiedSearchRequest):
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
-
-            if getattr(body, "verify_with_gdino", False) and raw:
-                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
-                cand_hits = raw[:topk]
-                prompts = body.verify_prompts or []
-                require = body.verify_require_all or []
-                if prompts:
-                    cand_hits = rerank_with_gdino(
-                        cand_hits,
-                        prompts=prompts,
-                        require_all=require,
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        w_clip=0.6, w_gdino=0.4
-                    )
-                    raw = cand_hits + raw[topk:]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h.get("frame"),
-                objects=h.get("objects"),
-                video_id=h["video_id"]
-            ) for h in raw]
+            raw = _postproc_hits(raw, key_mode="auto", k=None)
+            raw = _maybe_gdino_fuse(
+                raw,
+                verify_on=getattr(body, "verify_with_gdino", False),
+                prompts=body.verify_prompts or [],
+                require_all=body.verify_require_all or [],
+                box_th=body.verify_box_threshold,
+                text_th=body.verify_text_threshold,
+            )
+            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw = _postproc_hits(raw, key_mode="auto", k=body.k)
+            hits = [_as_unified(h) for h in raw]
             return UnifiedSearchResponse(video_id=None, mode="visual", hits=hits)
 
         # ---- ACTION (segment-level) ----
@@ -697,31 +676,19 @@ def unified_query(body: UnifiedSearchRequest):
                 restrict_videos=restrict
             )
 
-            if getattr(body, "verify_with_gdino", False) and raw:
-                topk = min(getattr(body, "verify_topk", 30) or 30, len(raw))
-                cand_hits = raw[:topk]
-                prompts = body.verify_prompts or []
-                require = body.verify_require_all or []
-                if prompts:
-                    cand_hits = rerank_with_gdino(
-                        cand_hits,
-                        prompts=prompts,
-                        require_all=require,
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        w_clip=0.6, w_gdino=0.4,
-                        frame_resolver=action_frame_resolver
-                    )
-                    raw = cand_hits + raw[topk:]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h.get("frame"),
-                objects=h.get("objects"),
-                video_id=h["video_id"]
-            ) for h in raw]
+            raw = _postproc_hits(raw, key_mode="time", k=None)
+            raw = _maybe_gdino_fuse(
+                raw,
+                verify_on=getattr(body, "verify_with_gdino", False),
+                prompts=body.verify_prompts or [],
+                require_all=body.verify_require_all or [],
+                box_th=body.verify_box_threshold,
+                text_th=body.verify_text_threshold,
+                frame_resolver=action_frame_resolver,
+            )
+            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw = _postproc_hits(raw, key_mode="time", k=body.k)
+            hits = [_as_unified(h) for h in raw]
             return UnifiedSearchResponse(video_id=None, mode="action", hits=hits)
 
         # ---- ACTION CHAIN (global: per-video chain, pick best) ----
@@ -738,25 +705,16 @@ def unified_query(body: UnifiedSearchRequest):
                         vid, body.steps, k_per_step=body.k,
                         max_gap=body.max_gap, filter_objects=body.filter_objects
                     )
-                    path_hits = dedupe_hits(path_hits, key_mode="time")
-                    path_hits = nms_time(path_hits, tol=0.5)
-
-                    if getattr(body, "verify_with_gdino", False) and path_hits:
-                        topk = min(getattr(body, "verify_topk", 30) or 30, len(path_hits))
-                        cand_hits = path_hits[:topk]
-                        prompts = body.verify_prompts or []
-                        require = body.verify_require_all or []
-                        if prompts:
-                            cand_hits = rerank_with_gdino(
-                                cand_hits,
-                                prompts=prompts,
-                                require_all=require,
-                                box_th=body.verify_box_threshold,
-                                text_th=body.verify_text_threshold,
-                                w_clip=0.6, w_gdino=0.4,
-                                frame_resolver=action_frame_resolver
-                            )
-                            path_hits = cand_hits + path_hits[topk:]
+                    path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
+                    path_hits = _maybe_gdino_fuse(
+                        path_hits,
+                        verify_on=getattr(body, "verify_with_gdino", False),
+                        prompts=body.verify_prompts or [],
+                        require_all=body.verify_require_all or [],
+                        box_th=body.verify_box_threshold,
+                        text_th=body.verify_text_threshold,
+                        frame_resolver=action_frame_resolver,
+                    )
 
                     # score the path (prefer fused)
                     def seg_score(h): return float(h.get("score_fused", h.get("score", 0.0)))
@@ -773,18 +731,9 @@ def unified_query(body: UnifiedSearchRequest):
 
             per_video.sort(key=lambda x: x[3], reverse=True)
             best_vid, best_path, best_cands, _ = per_video[0]
-
-            if body.k:
-                best_path = best_path[:body.k]
-
-            hits = [UnifiedSearchHit(
-                start=h["start"],
-                end=h["end"],
-                score=float(h.get("score_fused", h["score"])),
-                frame=h.get("frame"),
-                objects=h.get("objects"),
-                video_id=best_vid
-            ) for h in best_path]
+            best_path.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            best_path = _postproc_hits(best_path, key_mode="time", k=body.k)
+            hits = [_as_unified(h) for h in best_path]
 
             return UnifiedSearchResponse(
                 video_id=best_vid,
