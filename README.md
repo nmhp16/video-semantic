@@ -85,4 +85,20 @@ curl -X POST http://127.0.0.1:8000/query \
     "k":40
   }'
 ```
+
+# Verify action with Grounding Dino
+```
+curl -s -X POST http://127.0.0.1:8000/ov_verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "frames": [
+      "data/frames/zPxQjuFoUBc/frame-000003.jpg",
+      "data/frames/nP1BzMZR92c/frame-000002.jpg"
+    ],
+    "prompts": ["chef","cutting board","knife"],
+    "box_threshold": 0.3,
+    "text_threshold": 0.3
+  }'
+```
+
 # Check meta.sqlite for saved frames

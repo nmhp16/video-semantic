@@ -7,10 +7,11 @@ from store import (
     load_index, get_conn, load_visual_index, load_action_clips_index,
 )
 from models import (
-    SearchResponse, SearchHit, VideoIngestRequest,
+    SearchResponse, SearchHit, VideoIngestRequest, OVVerifyRequest,
     UnifiedSearchRequest, UnifiedSearchHit, UnifiedSearchResponse,
 )
 from utils_unified import extract_video_id
+from gdino import detect_on_image
 
 app = FastAPI()
 app.add_middleware(
@@ -528,3 +529,19 @@ def unified_query(body: UnifiedSearchRequest):
         raise HTTPException(400, "action_chain not supported with scope='global'")
 
     raise HTTPException(400, f"Unknown scope {scope}")
+
+@app.post("/ov_verify")
+def ov_verify(req: OVVerifyRequest):
+    out = {}
+    for f in req.frames:
+        try:
+            res = detect_on_image(
+                image_path=os.path.abspath(f),
+                prompts=req.prompts,
+                box_threshold=req.box_threshold,
+                text_threshold=req.text_threshold
+            )
+            out[f] = res
+        except Exception as e:
+            out[f] = {"detections": [], "debug": {"error": str(e)}}
+    return {"results": out}

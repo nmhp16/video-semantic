@@ -49,3 +49,9 @@ class UnifiedSearchResponse(BaseModel):
     mode: MODE
     hits: List[UnifiedSearchHit] = Field(default_factory=list)
     info: dict = Field(default_factory=dict)   # extra info (e.g., chosen path for action_chain)
+
+class OVVerifyRequest(BaseModel):
+    frames: List[str]
+    prompts: List[str]
+    box_threshold: float = 0.25
+    text_threshold: float = 0.25

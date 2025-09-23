@@ -10,3 +10,5 @@ sqlite-utils
 ultralytics
 opencv-python
 pillow
+torch
+torchvision
