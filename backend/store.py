@@ -1,7 +1,18 @@
 import os, sqlite3, faiss, numpy as np, json
 from typing import Optional, List, Tuple, Dict
-from collections import Counter
+from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer
+from bertopic import BERTopic
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+
+_nlp = None
+def _get_nlp():
+    global _nlp
+    if _nlp is None:
+        _nlp = spacy.load("en_core_web_sm", disable=["ner"]) 
+    return _nlp
 
 # --- Paths ---
 BASE = os.path.dirname(__file__)
@@ -254,47 +265,115 @@ def top_actions_for(video_id: str, conn: sqlite3.Connection, k: int = 20) -> Dic
     if not rows:
         return {}
     
-    # Simple action word extraction (could be improved with NLP)
-    action_words = ["cooking", "cutting", "chopping", "mixing", "pouring", "stirring", 
-                   "dancing", "walking", "running", "jumping", "talking", "singing",
-                   "playing", "hitting", "throwing", "catching", "lifting", "pushing"]
+    nlp = _get_nlp()
+    verb_counts = Counter()
+    vo_counts = Counter()
     
-    action_counts = Counter()
-    for row in rows:
-        if row[0]:
-            text = row[0].lower()
-            for action in action_words:
-                if action in text:
-                    action_counts[action] += text.count(action)
-    
-    return dict(action_counts.most_common(k))
+    for (txt,) in rows:
+        if not txt:
+            continue
+        doc = nlp(txt)
+        for tok in doc:
+            # Verbs
+            if tok.pos_ == "VERB" and tok.lemma_ not in ("be", "have", "do"):
+                v = tok.lemma_.lower()
+                verb_counts[v] += 1
 
-def derive_topics(summary: str, objects_topk: Dict[str, int], actions_topk: Dict[str, int]) -> List[str]:
-    """Derive topic keywords from summary and top objects/actions."""
+            # Capture verb + its object
+            dobj = None
+            for child in tok.children:
+                if child.dep_ in ("dobj", "obj") and child.pos_ in ("PROPN", "NOUN", "PRON"):
+                    dobj = child.lemma_.lower()
+                    break
+            if dobj:
+                vo_counts[f"{v} {dobj}"] += 1
+
+    # Merge, prefer verb object over verb
+    out = {}
+    for key, count in vo_counts.most_common(k):
+        out[key] = count
+    if len(out) < k:
+        for verb, count in verb_counts.most_common(k - len(out)):
+            out[verb] = count
+    return out
+
+def derive_topics(summary: str, objects_topk: dict, actions_topk: dict, texts: list[str] = None, topn=10):
+    texts = texts or []
+    corpus = [t for t in texts if t] + ([summary] if summary else [])
     topics = set()
-    
-    # Add top objects as topics
-    for obj in list(objects_topk.keys())[:5]:
-        topics.add(obj)
-    
-    # Add top actions as topics  
-    for action in list(actions_topk.keys())[:5]:
-        topics.add(action)
-    
-    # Simple keyword extraction from summary
-    if summary:
-        summary_lower = summary.lower()
-        # Kitchen/cooking related
-        if any(word in summary_lower for word in ["cook", "kitchen", "food", "recipe", "chef"]):
-            topics.add("cooking")
-        # Sports related
-        if any(word in summary_lower for word in ["sport", "game", "play", "ball", "court"]):
-            topics.add("sports")
-        # Music/dance related
-        if any(word in summary_lower for word in ["music", "dance", "sing", "song", "rhythm"]):
-            topics.add("music")
-    
+
+    # seed with structured signals
+    topics.update(list(objects_topk.keys())[:5])
+    topics.update(list(actions_topk.keys())[:5])
+
+    if corpus:
+        vec = TfidfVectorizer(
+            ngram_range=(1,2),
+            min_df=2,
+            max_features=1000,
+            stop_words="english",
+            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b"
+        )
+        X = vec.fit_transform(corpus)
+        scores = X.sum(axis=0).A1
+        vocab  = np.array(vec.get_feature_names_out())
+        order  = scores.argsort()[::-1]
+        for term in vocab[order]:
+            # skip overly generic words & those already present
+            if term in topics: 
+                continue
+            if re.match(r"^\d+$", term):
+                continue
+            topics.add(term)
+            if len(topics) >= topn + 10:  # allow some headroom
+                break
+
     return list(topics)
+
+from bertopic import BERTopic
+
+def _fetch_texts_for_video(video_id: str, conn: sqlite3.Connection, max_chunks: int = 300) -> list[str]:
+    rows = conn.execute("""
+        SELECT text FROM chunks
+        WHERE video_id=?
+        ORDER BY start
+        LIMIT ?
+    """, (video_id, max_chunks)).fetchall()
+    texts = [t for (t,) in rows if t and t.strip()]
+    # light cleanup
+    texts = [re.sub(r"\s+", " ", t).strip() for t in texts]
+    return texts
+
+def derive_topics_bertopic(texts: list[str], topn: int = 10, min_topic_size: int = 5) -> list[str]:
+    texts = [t for t in texts if t and t.strip()]
+    if not texts:
+        return []
+
+    # reuse your global embedding model by passing its name 
+    topic_model = BERTopic(min_topic_size=min_topic_size, calculate_probabilities=False, verbose=False,
+                           embedding_model="sentence-transformers/all-MiniLM-L6-v2")
+
+    topics, _ = topic_model.fit_transform(texts)
+    info = topic_model.get_topic_info()
+
+    out = []
+    # top 5 largest topics → top 3 terms each
+    for _, row in info.sort_values("Count", ascending=False).head(5).iterrows():
+        tid = int(row["Topic"])
+        if tid == -1:
+            continue  # skip noise topic
+        for term, _ in (topic_model.get_topic(tid) or [])[:3]:
+            out.append(term)
+
+    # dedupe & cap
+    final, seen = [], set()
+    for t in out:
+        t = t.strip().lower()
+        if t and t not in seen:
+            final.append(t); seen.add(t)
+        if len(final) >= topn:
+            break
+    return final
 
 def build_video_context(video_id: str) -> None:
     """Build and store video context summary for better search filtering."""
@@ -309,10 +388,21 @@ def build_video_context(video_id: str) -> None:
         actions_topk = top_actions_for(video_id, conn, k=20)
         
         # 3) Derive topics
-        topics = derive_topics(summary, objects_topk, actions_topk)
+        texts = _fetch_texts_for_video(video_id, conn, max_chunks=300)
+        if len(texts) < 10:
+            topics = derive_topics(summary, objects_topk, actions_topk, texts, topn=10)
+        else:
+            topics = derive_topics_bertopic(texts, topn=10, min_topic_size=5)
+
+        fused_topics = []
+        seen = set()
+        for t in (list(objects_topk.keys())[:5] + list(actions_topk.keys())[:5] + topics):
+            t0 = t.strip().lower()
+            if t0 and t0 not in seen:
+                fused_topics.append(t0); seen.add(t0)
         
         # 4) Create embedding
-        text_for_emb = summary or " ".join(topics) or ""
+        text_for_emb = summary or " ".join(fused_topics) or ""
         if text_for_emb.strip():
             emb = EMB.encode([text_for_emb], normalize_embeddings=True).astype("float32")[0]
             emb_blob = emb.tobytes()
@@ -336,14 +426,14 @@ def build_video_context(video_id: str) -> None:
             None,  # title - can be set later
             None,  # source_url - can be set later
             summary,
-            json.dumps(topics),
+            json.dumps(fused_topics),
             json.dumps(objects_topk),
             json.dumps(actions_topk),
             "en",  # lang - could detect later
             emb_blob
         ))
         conn.commit()
-        print(f"Built video context for {video_id}: {len(topics)} topics, {len(objects_topk)} objects, {len(actions_topk)} actions")
+        print(f"Built video context for {video_id}: {len(fused_topics)} topics, {len(objects_topk)} objects, {len(actions_topk)} actions")
         
     except Exception as e:
         print(f"Error building video context for {video_id}: {e}")
@@ -383,7 +473,7 @@ def _fetch_contexts(video_ids: Optional[List[str]] = None) -> List[Dict]:
 def filter_videos_by_context(query: str,
                            restrict_videos: Optional[List[str]] = None,
                            topn: int = 50,
-                           min_cos: float = 0.15) -> List[str]:
+                           min_cos: float = 0.28) -> List[str]:
     """Filter videos by context similarity before detailed search."""
     # 1) Embed the query once
     qv = EMB.encode([query], normalize_embeddings=True).astype("float32")[0]

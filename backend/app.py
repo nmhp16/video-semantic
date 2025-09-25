@@ -62,20 +62,17 @@ def dedupe_hits(hits, prefer="max", key_mode="auto"):
     return out
 
 def nms_time(hits, tol=0.5):
-    """
-    Greedy time-NMS: keep top-scoring hits and drop another hit whose
-    midpoint is within `tol` seconds of a kept hit.
-    """
     sorted_hits = sorted(hits, key=lambda x: -float(_val(x, "score", 0.0)))
     kept = []
-    def mid(h): 
-        return (float(_val(h, "start", 0.0)) + float(_val(h, "end", 0.0))) * 0.5
+    def mid(h):
+        return (float(_val(h,"start",0.0)) + float(_val(h,"end",0.0))) * 0.5
 
     for h in sorted_hits:
-        m = mid(h)
-        if all(abs(m - mid(k)) > tol for k in kept):
+        m, vid = mid(h), _val(h, "video_id")
+        if all(not (vid == _val(k,"video_id") and abs(m - mid(k)) <= tol) for k in kept):
             kept.append(h)
     return kept
+
 
 def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False) -> bool:
     idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
@@ -99,7 +96,7 @@ def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual:
         do_visual_ingest(video_url)
 
 def expand_prompt(prompt: str) -> list[str]:
-    return [prompt, f"a person {prompt}", f"someone {prompt}"]
+    return [prompt]
 
 def encode_prompt_set(clip_txt_model, prompts: list[str]) -> np.ndarray:
     X = clip_txt_model.encode(prompts, normalize_embeddings=True).astype('float32')

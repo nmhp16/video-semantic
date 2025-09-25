@@ -97,4 +97,11 @@ curl -X POST http://127.0.0.1:8000/query \
   }'
 ```
 
+curl -X GET "http://127.0.0.1:8000/asearch_all?q=chopping&k=5"
+
+# Build video context
+```
+curl -X POST "http://127.0.0.1:8000/build_contexts" -H "Content-Type: application/json"
+```
+
 # Check meta.sqlite for saved frames
