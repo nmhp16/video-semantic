@@ -261,7 +261,7 @@ def search_text_global(q: str, k: int, restrict_videos: Optional[list[str]] = No
         except Exception as e:
             print(f"[text global] skip {vid}: {e}")
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 def search_visual_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
@@ -276,10 +276,8 @@ def search_visual_global(q: str, k: int, filter_objects: Optional[str] = None,
             all_hits.extend(search_visual_single(vid, q, k, filter_objects))
         except Exception as e:
             print(f"[visual global] skip {vid}: {e}")
-    all_hits = dedupe_hits(all_hits, key_mode="auto")
-    all_hits = nms_time(all_hits, tol=0.5)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
@@ -294,10 +292,8 @@ def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
             all_hits.extend(search_action_single(vid, q, k, filter_objects))
         except Exception as e:
             print(f"[action global] skip {vid}: {e}")
-    all_hits = dedupe_hits(all_hits, key_mode="time")
-    all_hits = nms_time(all_hits, tol=0.5)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 # ---- Shared helpers ----
 def _postproc_hits(hits: list[dict], *, key_mode: str, k: int | None) -> list[dict]:
@@ -620,7 +616,6 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
             raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _postproc_hits(raw, key_mode="auto", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -637,7 +632,6 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
             raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _postproc_hits(raw, key_mode="time", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -661,7 +655,6 @@ def unified_query(body: UnifiedSearchRequest):
                 vid, body.steps, k_per_step=body.k,
                 max_gap=body.max_gap, filter_objects=body.filter_objects
             )
-            path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
             path_hits = _maybe_gdino_fuse(
                 path_hits,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -701,7 +694,6 @@ def unified_query(body: UnifiedSearchRequest):
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
-            raw = _postproc_hits(raw, key_mode="auto", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -723,7 +715,6 @@ def unified_query(body: UnifiedSearchRequest):
                 restrict_videos=restrict
             )
 
-            raw = _postproc_hits(raw, key_mode="time", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -752,7 +743,6 @@ def unified_query(body: UnifiedSearchRequest):
                         vid, body.steps, k_per_step=body.k,
                         max_gap=body.max_gap, filter_objects=body.filter_objects
                     )
-                    path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
                     path_hits = _maybe_gdino_fuse(
                         path_hits,
                         verify_on=getattr(body, "verify_with_gdino", False),
