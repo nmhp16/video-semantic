@@ -12,3 +12,5 @@ opencv-python
 pillow
 torch
 torchvision
+spacy
+bertopic

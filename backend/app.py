@@ -5,6 +5,7 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any, Callable
 from store import (
     load_index, get_conn, load_visual_index, load_action_clips_index,
+    filter_videos_by_context, passes_hard_context, build_video_context,
 )
 from models import (
     SearchResponse, SearchHit, VideoIngestRequest, OVVerifyRequest,
@@ -61,20 +62,17 @@ def dedupe_hits(hits, prefer="max", key_mode="auto"):
     return out
 
 def nms_time(hits, tol=0.5):
-    """
-    Greedy time-NMS: keep top-scoring hits and drop another hit whose
-    midpoint is within `tol` seconds of a kept hit.
-    """
     sorted_hits = sorted(hits, key=lambda x: -float(_val(x, "score", 0.0)))
     kept = []
-    def mid(h): 
-        return (float(_val(h, "start", 0.0)) + float(_val(h, "end", 0.0))) * 0.5
+    def mid(h):
+        return (float(_val(h,"start",0.0)) + float(_val(h,"end",0.0))) * 0.5
 
     for h in sorted_hits:
-        m = mid(h)
-        if all(abs(m - mid(k)) > tol for k in kept):
+        m, vid = mid(h), _val(h, "video_id")
+        if all(not (vid == _val(k,"video_id") and abs(m - mid(k)) <= tol) for k in kept):
             kept.append(h)
     return kept
+
 
 def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False) -> bool:
     idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
@@ -98,7 +96,7 @@ def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual:
         do_visual_ingest(video_url)
 
 def expand_prompt(prompt: str) -> list[str]:
-    return [prompt, f"a person {prompt}", f"someone {prompt}"]
+    return [prompt]
 
 def encode_prompt_set(clip_txt_model, prompts: list[str]) -> np.ndarray:
     X = clip_txt_model.encode(prompts, normalize_embeddings=True).astype('float32')
@@ -251,7 +249,11 @@ def _globally(needle_ext: str, restrict: Optional[list[str]]) -> list[str]:
     return [v for v in vids if (not restrict or v in restrict)]
 
 def search_text_global(q: str, k: int, restrict_videos: Optional[list[str]] = None):
-    vids = _globally(".faiss", restrict_videos)
+    # Context pre-filter
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    # Fall back to everything if nothing passes context filter
+    vids = candidates if candidates else _globally(".faiss", restrict_videos)
+    
     all_hits = []
     for vid in vids:
         try:
@@ -259,35 +261,39 @@ def search_text_global(q: str, k: int, restrict_videos: Optional[list[str]] = No
         except Exception as e:
             print(f"[text global] skip {vid}: {e}")
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 def search_visual_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
-    vids = _globally(".vfaiss", restrict_videos)
+    # Context pre-filter
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    # Fall back to everything if nothing passes context filter
+    vids = candidates if candidates else _globally(".vfaiss", restrict_videos)
+    
     all_hits = []
     for vid in vids:
         try:
             all_hits.extend(search_visual_single(vid, q, k, filter_objects))
         except Exception as e:
             print(f"[visual global] skip {vid}: {e}")
-    all_hits = dedupe_hits(all_hits, key_mode="auto")
-    all_hits = nms_time(all_hits, tol=0.5)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
-    vids = _globally(".aclip.faiss", restrict_videos)
+    # Context pre-filter
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    # Fall back to everything if nothing passes context filter
+    vids = candidates if candidates else _globally(".aclip.faiss", restrict_videos)
+    
     all_hits = []
     for vid in vids:
         try:
             all_hits.extend(search_action_single(vid, q, k, filter_objects))
         except Exception as e:
             print(f"[action global] skip {vid}: {e}")
-    all_hits = dedupe_hits(all_hits, key_mode="time")
-    all_hits = nms_time(all_hits, tol=0.5)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    return all_hits[:k]
+    return all_hits
 
 # ---- Shared helpers ----
 def _postproc_hits(hits: list[dict], *, key_mode: str, k: int | None) -> list[dict]:
@@ -311,7 +317,6 @@ def _maybe_gdino_fuse(
 ) -> list[dict]:
     if not (verify_on and prompts and hits):
         return hits
-    # use existing helper; just pass through
     topk = min(30, len(hits))
     cand = hits[:topk]
     cand = rerank_with_gdino(
@@ -513,6 +518,9 @@ async def ingest_video(request: VideoIngestRequest):
 
         do_ingest(video_url)        # text (ASR + embeddings)
         do_visual_ingest(video_url) # visual (frames + action clips)
+        
+        # Build video context for better search filtering
+        build_video_context(video_id)
 
         return {"success": True, "message": f"Video {video_id} ingested successfully",
                 "video_id": video_id, "status": "completed"}
@@ -520,6 +528,41 @@ async def ingest_video(request: VideoIngestRequest):
     except Exception as e:
         print(f"Ingestion error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/build_contexts")
+async def rebuild_video_contexts(video_ids: Optional[List[str]] = None):
+    """Build/rebuild video contexts for existing videos."""
+    try:
+        if video_ids is None:
+            # Build contexts for all videos that have any index
+            from store import get_conn
+            conn = get_conn()
+            rows = conn.execute("""
+                SELECT DISTINCT video_id FROM chunks
+                UNION
+                SELECT DISTINCT video_id FROM visual_chunks
+                UNION  
+                SELECT DISTINCT video_id FROM visual_clips
+            """).fetchall()
+            conn.close()
+            video_ids = [row[0] for row in rows]
+        
+        results = []
+        for video_id in video_ids:
+            try:
+                build_video_context(video_id)
+                results.append({"video_id": video_id, "status": "success"})
+            except Exception as e:
+                results.append({"video_id": video_id, "status": "error", "error": str(e)})
+        
+        success_count = sum(1 for r in results if r["status"] == "success")
+        return {
+            "success": True,
+            "message": f"Built contexts for {success_count}/{len(results)} videos",
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ov_verify")
 def ov_verify(req: OVVerifyRequest):
@@ -573,7 +616,6 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
             raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _postproc_hits(raw, key_mode="auto", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -590,7 +632,6 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
             raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _postproc_hits(raw, key_mode="time", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -614,7 +655,6 @@ def unified_query(body: UnifiedSearchRequest):
                 vid, body.steps, k_per_step=body.k,
                 max_gap=body.max_gap, filter_objects=body.filter_objects
             )
-            path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
             path_hits = _maybe_gdino_fuse(
                 path_hits,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -654,7 +694,6 @@ def unified_query(body: UnifiedSearchRequest):
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
-            raw = _postproc_hits(raw, key_mode="auto", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -676,7 +715,6 @@ def unified_query(body: UnifiedSearchRequest):
                 restrict_videos=restrict
             )
 
-            raw = _postproc_hits(raw, key_mode="time", k=None)
             raw = _maybe_gdino_fuse(
                 raw,
                 verify_on=getattr(body, "verify_with_gdino", False),
@@ -705,7 +743,6 @@ def unified_query(body: UnifiedSearchRequest):
                         vid, body.steps, k_per_step=body.k,
                         max_gap=body.max_gap, filter_objects=body.filter_objects
                     )
-                    path_hits = _postproc_hits(path_hits, key_mode="time", k=None)
                     path_hits = _maybe_gdino_fuse(
                         path_hits,
                         verify_on=getattr(body, "verify_with_gdino", False),

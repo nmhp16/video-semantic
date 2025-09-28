@@ -26,7 +26,7 @@ class UnifiedSearchRequest(BaseModel):
     video_id: Optional[str] = None
     query: Optional[str] = None
     mode: MODE
-    k: int = 10
+    k: int = 50
     filter_objects: Optional[str] = None
     # Action chain params
     steps: Optional[List[str]] = None
