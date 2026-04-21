@@ -3,9 +3,12 @@ from typing import List, Dict
 from PIL import Image
 import numpy as np
 import torch
-from sentence_transformers import SentenceTransformer
-from transformers import AutoProcessor, AutoModelForCausalLM
-from store import DATA, save_visual_index, save_action_clips_index
+from transformers import AutoProcessor, AutoModelForCausalLM, SiglipModel
+from store import (
+    DATA,
+    save_visual_metadata, save_action_clips_metadata,
+    save_siglip_visual_index, save_siglip_action_clips_index,
+)
 import re
 from pathlib import Path
 from ingest import extract_audio
@@ -30,41 +33,78 @@ def _has_video_stream(path: str) -> bool:
 def ytdlp_video(url: str, out_mp4: str):
     if os.path.exists(out_mp4) and not _has_video_stream(out_mp4):
         os.remove(out_mp4)
+    from ingest import _ytdlp_auth_args
     subprocess.check_call([
         "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
-        "-o", out_mp4, url
+        "-o", out_mp4, *_ytdlp_auth_args(), url
     ])
 
-# --- Frame sampling ---
-def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List[Dict]:
+# --- Frame sampling (scene-change + max-gap) ---
+_META_FRAME_RE = re.compile(r"^frame:\d+.*pts_time:([0-9.]+)")
+
+def sample_frames(video_path: str, out_dir: str,
+                  max_gap_sec: float = 5.0,
+                  scene_thresh: float = 0.3) -> List[Dict]:
+    """Emit a frame when the scene changes OR when more than max_gap_sec
+    has passed since the last emitted frame. The first frame is always emitted.
+    Returns one dict per written JPEG with its real pts_time-derived t / t_end.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
-    # Infer duration using ffprobe
+    # Infer duration using ffprobe (for clipping the last frame's t_end)
     probe = subprocess.check_output([
-        "ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1", video_path
+        "ffprobe","-v","error","-show_entries","format=duration",
+        "-of","default=noprint_wrappers=1:nokey=1", video_path
     ]).decode().strip()
     duration = float(probe) if probe else 0.0
 
-    # Use fps = 1 / every_sec
-    fps = max(0.0001, 1.0 / every_sec)
+    ts_path = os.path.join(out_dir, "_frames_ts.txt")
+    if os.path.exists(ts_path):
+        os.remove(ts_path)
 
-    # FFMPEG write frame-%06d.jpg starting at index 0
+    # select=<expr>: emit frame if scene-change OR first frame OR gap elapsed.
+    # Commas inside function calls are escaped with \\, to survive the filter parser.
+    filt = (
+        f"select='gt(scene\\,{scene_thresh})"
+        f"+eq(n\\,0)"
+        f"+gte(t-prev_selected_t\\,{max_gap_sec})',"
+        f"scale=-2:720,"
+        f"metadata=print:file={ts_path}"
+    )
+
     subprocess.check_call([
         "ffmpeg","-y","-i", video_path,
-        "-vf", f"fps={fps},scale=-2:720",
+        "-vf", filt,
+        "-fps_mode", "vfr",
         "-q:v", "3",
         os.path.join(out_dir, "frame-%06d.jpg")
     ])
 
-    # Collect files and compute timestamps by index * every_sec
-    frames = sorted([f for f in os.listdir(out_dir) if f.startswith("frame-") and f.endswith(".jpg")])
+    # Parse per-frame pts_time from the metadata sidecar
+    timestamps: List[float] = []
+    if os.path.exists(ts_path):
+        with open(ts_path) as f:
+            for line in f:
+                m = _META_FRAME_RE.match(line)
+                if m:
+                    timestamps.append(float(m.group(1)))
+
+    frame_files = sorted([
+        f for f in os.listdir(out_dir)
+        if f.startswith("frame-") and f.endswith(".jpg")
+    ])
+
     out = []
-    for i, fn in enumerate(frames):
-        t = i * every_sec
+    for i, fn in enumerate(frame_files):
+        t = timestamps[i] if i < len(timestamps) else i * max_gap_sec
+        if i + 1 < len(timestamps):
+            t_end = min(duration, timestamps[i + 1])
+        else:
+            t_end = min(duration, t + max_gap_sec)
         out.append({
-        "path": os.path.join(out_dir, fn),
-        "t": t,
-        "t_end": min(duration, (i+1)*every_sec)
+            "path": os.path.join(out_dir, fn),
+            "t": t,
+            "t_end": t_end,
         })
 
     return out
@@ -130,6 +170,41 @@ class Florence2Captioner:
         return results
 
 
+# --- SigLIP vision-text encoder (for direct frame embedding) ---
+class SigLIPEncoder:
+    def __init__(self, model_id: str = "google/siglip-base-patch16-224"):
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif torch.backends.mps.is_available():
+            self._device = "mps"
+        else:
+            self._device = "cpu"
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = SiglipModel.from_pretrained(model_id).to(self._device).eval()
+
+    def encode_images(self, pil_images: List[Image.Image], batch_size: int = 16) -> np.ndarray:
+        all_embs = []
+        for i in range(0, len(pil_images), batch_size):
+            batch = pil_images[i:i + batch_size]
+            inputs = self.processor(images=batch, return_tensors="pt").to(self._device)
+            with torch.no_grad():
+                feats = self.model.get_image_features(**inputs)
+            feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            all_embs.append(feats.float().cpu().numpy())
+            if (i + batch_size) % 64 == 0 or i + batch_size >= len(pil_images):
+                print(f"  siglip {min(i + batch_size, len(pil_images))}/{len(pil_images)} frames")
+        return np.concatenate(all_embs, axis=0).astype("float32")
+
+    def encode_text(self, texts: List[str]) -> np.ndarray:
+        inputs = self.processor(
+            text=texts, return_tensors="pt", padding="max_length", truncation=True
+        ).to(self._device)
+        with torch.no_grad():
+            feats = self.model.get_text_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        return feats.float().cpu().numpy().astype("float32")
+
+
 # --- Build sliding-window action clips from caption embeddings ---
 def build_caption_windows(frames, embs, captions_data, clip_len=2.0, stride=0.5):
     """Build sliding windows using caption embeddings (bge-small space)."""
@@ -170,7 +245,7 @@ def build_caption_windows(frames, embs, captions_data, clip_len=2.0, stride=0.5)
     return np.stack(clip_vecs, axis=0).astype("float32"), rows
 
 
-def ingest_visual(url_or_path: str, every_sec: float = 1.0):
+def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: float = 0.3):
     # Resolve video_id
     m = YT_ID_RE.search(url_or_path)
     if m:
@@ -201,50 +276,52 @@ def ingest_visual(url_or_path: str, every_sec: float = 1.0):
         raise FileNotFoundError(f"Could not find video for {video_id}")
 
     out_dir = os.path.join(FRAMES, video_id)
-    frames = sample_frames(src, out_dir, every_sec=every_sec)
+    frames = sample_frames(src, out_dir, max_gap_sec=max_gap_sec, scene_thresh=scene_thresh)
 
-    # Caption every frame with Florence-2
-    print(f"Captioning {len(frames)} frames with Florence-2...")
-    captioner = Florence2Captioner("microsoft/Florence-2-base")
+    # Load frames once
     pil_images = [Image.open(f["path"]).convert("RGB") for f in frames]
-    captions_data = captioner.process_images(pil_images)
 
-    # Embed captions with bge-small (same space as text/ASR search)
-    print("Embedding captions...")
-    emb_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    caption_texts = [cd["caption"] for cd in captions_data]
-    embs = emb_model.encode(caption_texts, normalize_embeddings=True)
-    embs = np.array(embs, dtype="float32")
+    # SigLIP frame embeddings (direct vision-text contrastive space — no captioning)
+    print(f"SigLIP-encoding {len(frames)} frames...")
+    siglip = SigLIPEncoder("google/siglip-base-patch16-224")
+    siglip_embs = siglip.encode_images(pil_images, batch_size=16)
 
-    # Action clips (sliding windows over caption embeddings)
-    clip_vecs, clip_rows = build_caption_windows(
-        frames, embs, captions_data, clip_len=2.0, stride=0.5
+    # Placeholder captions_data — captions are generated lazily at query time.
+    # build_caption_windows only uses the 'objects' field for aggregation, which
+    # is an empty list when captions aren't pre-generated.
+    captions_data = [{"caption": "", "objects": []} for _ in frames]
+
+    # Action clips: sliding windows over SigLIP frame embeddings
+    siglip_clip_vecs, clip_rows = build_caption_windows(
+        frames, siglip_embs, captions_data, clip_len=2.0, stride=0.5
     )
-    save_action_clips_index(video_id, clip_vecs, clip_rows)
-    print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
+    save_siglip_action_clips_index(video_id, siglip_clip_vecs)
+    save_action_clips_metadata(video_id, clip_rows)
+    print(f"ACTION CLIPS OK: {video_id} | clips={len(siglip_clip_vecs)}")
 
-    # Rows for visual frame index
+    # Frame-level metadata rows (captions/objects empty; filled lazily on query)
     rows = []
     for i, f in enumerate(frames):
         rows.append({
             "start": float(f["t"]),
             "end":   float(f["t_end"]),
             "frame": os.path.relpath(f["path"], start=os.path.dirname(DATA)),
-            "objects": captions_data[i]["objects"],
-            "caption": captions_data[i]["caption"],
+            "objects": [],
+            "caption": "",
         })
 
-    # Store
-    save_visual_index(video_id, embs, rows)
+    save_siglip_visual_index(video_id, siglip_embs)
+    save_visual_metadata(video_id, rows)
     print(f"INGEST OK: {video_id} | frames={len(frames)}")
 
 if __name__ == "__main__":
     import sys, os
     if len(sys.argv) < 2:
-        print("Usage: ingest_visual.py <url_or_path> [every_sec]")
+        print("Usage: ingest_visual.py <url_or_path> [max_gap_sec] [scene_thresh]")
         sys.exit(1)
 
     url_or_path = sys.argv[1]
-    every_sec = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+    max_gap_sec = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+    scene_thresh = float(sys.argv[3]) if len(sys.argv) > 3 else 0.3
 
-    ingest_visual(url_or_path, every_sec=every_sec)
+    ingest_visual(url_or_path, max_gap_sec=max_gap_sec, scene_thresh=scene_thresh)

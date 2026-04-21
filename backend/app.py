@@ -5,7 +5,9 @@ import numpy as np, json, os
 from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any
 from store import (
-    load_index, get_conn, load_visual_index, load_action_clips_index,
+    load_index, get_conn,
+    load_siglip_visual_index, load_siglip_action_clips_index,
+    get_cached_captions, put_cached_captions,
     filter_videos_by_context, passes_hard_context, build_video_context,
 )
 from models import (
@@ -31,6 +33,68 @@ app.mount("/frames", StaticFiles(directory=_frames_dir), name="frames")
 app.mount("/media", StaticFiles(directory=_media_dir), name="media")
 
 EMB = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+# SigLIP text tower — loaded lazily so /search and /videos aren't slowed at startup
+_SIGLIP = None
+def _get_siglip():
+    global _SIGLIP
+    if _SIGLIP is None:
+        from visual_ingest import SigLIPEncoder
+        _SIGLIP = SigLIPEncoder("google/siglip-base-patch16-224")
+    return _SIGLIP
+
+# Florence-2 captioner — loaded lazily the first time a query needs captions.
+_CAPTIONER = None
+def _get_captioner():
+    global _CAPTIONER
+    if _CAPTIONER is None:
+        from visual_ingest import Florence2Captioner
+        _CAPTIONER = Florence2Captioner("microsoft/Florence-2-base")
+    return _CAPTIONER
+
+def _caption_hits_lazy(video_id: Optional[str], hits: list[dict]) -> None:
+    """Fill in 'caption' and 'objects' on each hit dict in place.
+    Reads from the sqlite caption_cache first; runs Florence-2 only for frames
+    that aren't cached yet, then writes the new captions back to the cache.
+    Pass video_id=None for mixed-video (global-scope) lists; the function then
+    groups hits by hit['video_id']."""
+    if not hits:
+        return
+
+    # Group hits by video_id so cache reads/writes are per-video
+    by_vid: dict = {}
+    for h in hits:
+        vid = video_id or h.get("video_id")
+        if not vid or not h.get("frame"):
+            continue
+        by_vid.setdefault(vid, []).append(h)
+
+    captioner = None
+    for vid, vhits in by_vid.items():
+        frames = [h["frame"] for h in vhits]
+        cached = get_cached_captions(vid, frames)
+        missing = [h for h in vhits if h["frame"] not in cached]
+        new_entries: dict = {}
+        if missing:
+            if captioner is None:
+                captioner = _get_captioner()
+            for h in missing:
+                frame = h["frame"]
+                abs_path = os.path.join(os.path.dirname(_data_dir), frame) if not os.path.isabs(frame) else frame
+                try:
+                    from PIL import Image as _PilImage
+                    img = _PilImage.open(abs_path).convert("RGB")
+                    result = captioner.process_image(img)
+                except Exception as e:
+                    print(f"[lazy caption] failed for {frame}: {e}")
+                    result = {"caption": "", "objects": []}
+                new_entries[frame] = result
+            put_cached_captions(vid, new_entries)
+
+        for h in vhits:
+            entry = cached.get(h["frame"]) or new_entries.get(h["frame"]) or {"caption": "", "objects": []}
+            h["caption"] = entry["caption"]
+            h["objects"] = entry["objects"]
 
 # --------------------
 # Utilities
@@ -87,9 +151,9 @@ def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=
     if need_text:
         ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.faiss"))
     if need_visual:
-        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.vfaiss"))
+        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.svfaiss"))
     if need_action:
-        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.aclip.faiss"))
+        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.saclip.faiss"))
     return ok
 
 def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual: bool, need_action: bool):
@@ -99,7 +163,7 @@ def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual:
     idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
     if need_text and not os.path.exists(os.path.join(idx_dir, f"{video_id}.faiss")):
         do_ingest(video_url)
-    if need_visual_or_action and not os.path.exists(os.path.join(idx_dir, f"{video_id}.vfaiss")):
+    if need_visual_or_action and not os.path.exists(os.path.join(idx_dir, f"{video_id}.svfaiss")):
         do_visual_ingest(video_url)
 
 def expand_prompt(prompt: str) -> list[str]:
@@ -112,8 +176,9 @@ def encode_prompt_set(model, prompts: list[str]) -> np.ndarray:
     return v.reshape(1, -1)
 
 def search_action_clips(video_id: str, q: str, k: int, filter_objects: str | None):
-    index, rows = load_action_clips_index(video_id)
-    qv = encode_prompt_set(EMB, expand_prompt(q))
+    """Legacy-named action search; now backed by the SigLIP action-clip index."""
+    index, rows = load_siglip_action_clips_index(video_id)
+    qv = _get_siglip().encode_text([q])
     D, I = index.search(qv, k)
     hits = []
     for score, idx in zip(D[0].tolist(), I[0].tolist()):
@@ -121,7 +186,7 @@ def search_action_clips(video_id: str, q: str, k: int, filter_objects: str | Non
             continue
         _, start, end, objects_json, caption = rows[idx]
         objs = json.loads(objects_json) if objects_json else []
-        if filter_objects and (filter_objects not in objs):
+        if filter_objects and objs and (filter_objects not in objs):
             continue
         hits.append({
             "video_id": video_id,
@@ -222,17 +287,28 @@ def search_text_single(video_id: str, q: str, k: int):
         })
     return out
 
+def _apply_filter_objects(objs: List[str], filter_objects: Optional[str]) -> bool:
+    """Return True if this hit should be kept. If objects list is empty (no
+    captions generated yet), the filter is a no-op rather than rejecting the hit."""
+    if not filter_objects:
+        return True
+    if not objs:
+        return True
+    return filter_objects in objs
+
 def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str]):
-    index, rows = load_visual_index(video_id)
-    qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
+    """Visual frame search backed by SigLIP vision-text embeddings."""
+    index, rows = load_siglip_visual_index(video_id)
+    qv = _get_siglip().encode_text([q])
     D, I = index.search(qv, k)
     out = []
     import json as _json
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1: continue
+        if idx == -1:
+            continue
         _, start, end, frame, objects, caption = rows[idx]
         objs = _json.loads(objects) if objects else []
-        if filter_objects and filter_objects not in objs:
+        if not _apply_filter_objects(objs, filter_objects):
             continue
         out.append({
             "video_id": video_id,
@@ -243,15 +319,26 @@ def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional
     return out
 
 def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional[str]):
-    hits = search_action_clips(video_id, q, k, filter_objects)
-    return [
-        {
+    """Action-clip search backed by SigLIP vision-text embeddings."""
+    import json as _json
+    index, rows = load_siglip_action_clips_index(video_id)
+    qv = _get_siglip().encode_text([q])
+    D, I = index.search(qv, k)
+    out = []
+    for s, idx in zip(D[0].tolist(), I[0].tolist()):
+        if idx == -1:
+            continue
+        _, start, end, objects_json, caption = rows[idx]
+        objs = _json.loads(objects_json) if objects_json else []
+        if not _apply_filter_objects(objs, filter_objects):
+            continue
+        out.append({
             "video_id": video_id,
-            "start": h["start"], "end": h["end"],
-            "score": h["score"], "objects": h.get("objects")
-        }
-        for h in hits
-    ]
+            "start": float(start), "end": float(end),
+            "score": float(s), "objects": objs,
+            "caption": caption or "",
+        })
+    return out
 
 def _globally(needle_ext: str, restrict: Optional[list[str]]) -> list[str]:
     vids = list_video_ids_with(needle_ext)
@@ -276,9 +363,9 @@ def search_visual_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
     # Context pre-filter
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
-    # Fall back to everything if nothing passes context filter
-    vids = candidates if candidates else _globally(".vfaiss", restrict_videos)
-    
+    # Fall back to SigLIP-indexed videos if nothing passes context filter
+    vids = candidates if candidates else _globally(".svfaiss", restrict_videos)
+
     all_hits = []
     for vid in vids:
         try:
@@ -292,9 +379,9 @@ def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
                          restrict_videos: Optional[list[str]] = None):
     # Context pre-filter
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
-    # Fall back to everything if nothing passes context filter
-    vids = candidates if candidates else _globally(".aclip.faiss", restrict_videos)
-    
+    # Fall back to SigLIP-indexed videos if nothing passes context filter
+    vids = candidates if candidates else _globally(".saclip.faiss", restrict_videos)
+
     all_hits = []
     for vid in vids:
         try:
@@ -374,27 +461,11 @@ async def search(video_id: str = Query(...), q: str = Query(...), k: int = 5):
 
 @app.get("/vsearch")
 async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, filter_objects: str | None = None):
+    """Legacy visual search; now backed by the SigLIP frame index."""
     try:
-        index, rows = load_visual_index(video_id)
+        hits = search_visual_single(video_id, q, k, filter_objects)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
-    
-    qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
-    D, I = index.search(qv, k)
-    hits = []
-    import json as _json
-    for score, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1:
-            continue
-        _, start, end, frame, objects, caption = rows[idx]
-        objs = _json.loads(objects) if objects else []
-        if filter_objects and filter_objects not in objs:
-            continue
-        hits.append({
-            "start": float(start), "end": float(end), "frame": frame,
-            "objects": objs, "score": float(score), "video_id": video_id,
-            "caption": caption or "",
-        })
 
     hits = dedupe_hits(hits, key_mode="auto")
     hits = nms_time(hits, tol=0.5)
@@ -474,8 +545,8 @@ async def list_videos():
                 vid = filename[:-4]
                 indexes_dir = os.path.join(data_dir, "indexes")
                 has_text = os.path.exists(os.path.join(indexes_dir, f"{vid}.faiss"))
-                has_visual = os.path.exists(os.path.join(indexes_dir, f"{vid}.vfaiss"))
-                has_actions = os.path.exists(os.path.join(indexes_dir, f"{vid}.aclip.faiss"))
+                has_visual = os.path.exists(os.path.join(indexes_dir, f"{vid}.svfaiss"))
+                has_actions = os.path.exists(os.path.join(indexes_dir, f"{vid}.saclip.faiss"))
                 videos.append({
                     "video_id": vid,
                     "has_text_search": has_text,
@@ -630,7 +701,12 @@ def unified_query(body: UnifiedSearchRequest):
 
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
-            raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
+            # Over-fetch so post-caption filter/rerank has headroom
+            raw = search_visual_single(vid, body.query or "", body.k * 3, body.filter_objects)
+            _caption_hits_lazy(vid, raw)
+            # Post-caption filter_objects (now that object words are available)
+            if body.filter_objects:
+                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -644,7 +720,14 @@ def unified_query(body: UnifiedSearchRequest):
 
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
-            raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
+            raw = search_action_single(vid, body.query or "", body.k * 3, body.filter_objects)
+            # Resolve a representative frame per segment, then lazy-caption those frames
+            for h in raw:
+                if not h.get("frame"):
+                    h["frame"] = representative_frame_for_segment(vid, h["start"], h["end"])
+            _caption_hits_lazy(vid, raw)
+            if body.filter_objects:
+                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -697,10 +780,13 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
             raw = search_visual_global(
-                body.query or "", body.k,
+                body.query or "", body.k * 3,
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
+            _caption_hits_lazy(None, raw)
+            if body.filter_objects:
+                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -715,11 +801,16 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
             raw = search_action_global(
-                body.query or "", body.k,
+                body.query or "", body.k * 3,
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
-
+            for h in raw:
+                if not h.get("frame"):
+                    h["frame"] = representative_frame_for_segment(h["video_id"], h["start"], h["end"])
+            _caption_hits_lazy(None, raw)
+            if body.filter_objects:
+                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -736,7 +827,7 @@ def unified_query(body: UnifiedSearchRequest):
             if not body.steps:
                 raise HTTPException(400, "steps is required for mode=action_chain")
 
-            vids = _globally(".aclip.faiss", restrict)
+            vids = _globally(".saclip.faiss", restrict)
             per_video = []  # (video_id, path_hits, cand_per_step, total_score)
 
             for vid in vids:

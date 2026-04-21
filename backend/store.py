@@ -32,6 +32,10 @@ VINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.vfaiss")
 # Action index paths
 ACLIP_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.aclip.faiss")
 
+# SigLIP visual (frames) and action-clip paths — parallel to the caption-based indexes
+SVINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.svfaiss")
+SACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.saclip.faiss")
+
 # Initialize embedding model for video context
 EMB = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
@@ -87,6 +91,17 @@ def get_conn():
         pass
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS caption_cache(
+            video_id TEXT,
+            frame TEXT,
+            caption TEXT,
+            objects TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(video_id, frame)
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS video_context(
             video_id TEXT PRIMARY KEY,
             title TEXT,
@@ -111,11 +126,13 @@ def clear_video(video_id: str):
     conn.execute("DELETE FROM visual_chunks WHERE video_id=?", (video_id,))
     conn.execute("DELETE FROM visual_clips  WHERE video_id=?", (video_id,))
     conn.execute("DELETE FROM video_context WHERE video_id=?", (video_id,))
+    conn.execute("DELETE FROM caption_cache WHERE video_id=?", (video_id,))
     conn.commit()
     conn.close()
 
     # Remove index files
-    for p in (INDEX_PATH(video_id), ACLIP_PATH(video_id), VINDEX_PATH(video_id), META_PATH(video_id)):
+    for p in (INDEX_PATH(video_id), ACLIP_PATH(video_id), VINDEX_PATH(video_id),
+              META_PATH(video_id), SVINDEX_PATH(video_id), SACLIP_PATH(video_id)):
         try:
             os.remove(p)
         except FileNotFoundError:
@@ -222,6 +239,121 @@ def load_action_clips_index(video_id: str):
     """, (video_id,)).fetchall()
     conn.close()
     return index, rows
+
+# --- SigLIP visual/action indexes (vision-text contrastive space) ---
+# These are parallel to the caption-based visual_chunks / visual_clips rows
+# (same row ordering, same start/end/frame metadata). We only persist the
+# FAISS vectors — metadata comes from the existing SQLite tables at load time.
+
+def _save_ip_index(path: str, embeddings: np.ndarray):
+    d = embeddings.shape[1]
+    if os.path.exists(path):
+        try:
+            existing = faiss.read_index(path)
+            if existing.d != d:
+                os.remove(path)
+        except Exception:
+            os.remove(path)
+    index = faiss.IndexFlatIP(d)
+    vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
+    index.add(vecs.astype('float32'))
+    faiss.write_index(index, path)
+
+def save_siglip_visual_index(video_id: str, embeddings: np.ndarray):
+    _save_ip_index(SVINDEX_PATH(video_id), embeddings)
+
+def load_siglip_visual_index(video_id: str):
+    index = faiss.read_index(SVINDEX_PATH(video_id))
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT idx, start, end, frame, objects, caption
+        FROM visual_chunks
+        WHERE video_id=?
+        ORDER BY idx
+    """, (video_id,)).fetchall()
+    conn.close()
+    return index, rows
+
+def save_siglip_action_clips_index(video_id: str, embeddings: np.ndarray):
+    _save_ip_index(SACLIP_PATH(video_id), embeddings)
+
+def load_siglip_action_clips_index(video_id: str):
+    index = faiss.read_index(SACLIP_PATH(video_id))
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT idx, start, end, objects, caption
+        FROM visual_clips
+        WHERE video_id=?
+        ORDER BY idx
+    """, (video_id,)).fetchall()
+    conn.close()
+    return index, rows
+
+# --- Metadata-only writers (for SigLIP-only ingest; no caption FAISS index) ---
+def save_visual_metadata(video_id: str, chunks: list[dict]):
+    """Write per-frame metadata rows without building a caption FAISS index.
+    Used when visual ingest relies on SigLIP alone; caption/objects may be empty."""
+    conn = get_conn()
+    conn.executemany(
+        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        [(video_id, i, c["start"], c["end"], c["frame"],
+          json.dumps(c.get("objects", [])), c.get("caption", ""))
+         for i, c in enumerate(chunks)]
+    )
+    conn.commit()
+    conn.close()
+
+def save_action_clips_metadata(video_id: str, rows: list[dict]):
+    """Write per-action-clip metadata rows without building a caption FAISS index."""
+    conn = get_conn()
+    conn.executemany(
+        "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
+        [(video_id, i, r["start"], r["end"],
+          json.dumps(r.get("objects", [])), r.get("caption", ""))
+         for i, r in enumerate(rows)]
+    )
+    conn.commit()
+    conn.close()
+
+# --- Caption cache (lazy Florence-2 output) ---
+def get_cached_captions(video_id: str, frames: list[str]) -> Dict[str, Dict]:
+    """Return {frame_path: {caption, objects}} for any cached frames."""
+    if not frames:
+        return {}
+    conn = get_conn()
+    qmarks = ",".join(["?"] * len(frames))
+    rows = conn.execute(
+        f"SELECT frame, caption, objects FROM caption_cache "
+        f"WHERE video_id=? AND frame IN ({qmarks})",
+        (video_id, *frames)
+    ).fetchall()
+    conn.close()
+    out = {}
+    for frame, caption, objects in rows:
+        try:
+            objs = json.loads(objects) if objects else []
+        except Exception:
+            objs = []
+        out[frame] = {"caption": caption or "", "objects": objs}
+    return out
+
+def put_cached_captions(video_id: str, entries: Dict[str, Dict]) -> None:
+    """entries: {frame_path: {caption, objects}}"""
+    if not entries:
+        return
+    conn = get_conn()
+    conn.executemany(
+        """INSERT INTO caption_cache(video_id, frame, caption, objects, updated_at)
+           VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(video_id, frame) DO UPDATE SET
+             caption=excluded.caption,
+             objects=excluded.objects,
+             updated_at=CURRENT_TIMESTAMP""",
+        [(video_id, frame, e.get("caption", ""), json.dumps(e.get("objects", [])))
+         for frame, e in entries.items()]
+    )
+    conn.commit()
+    conn.close()
 
 # --- VIDEO CONTEXT FUNCTIONS ---
 

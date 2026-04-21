@@ -13,8 +13,27 @@ os.makedirs(TRANS, exist_ok=True)
 
 YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
+def _ytdlp_auth_args() -> list[str]:
+    """Optional YouTube auth args from env.
+    YTDLP_COOKIES_FROM_BROWSER=chrome|firefox|safari|edge|brave|vivaldi|...
+    YTDLP_COOKIES=/absolute/path/to/cookies.txt (Netscape format)"""
+    args: list[str] = []
+    browser = os.environ.get("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+    if browser:
+        args += ["--cookies-from-browser", browser]
+    cookies_file = os.environ.get("YTDLP_COOKIES", "").strip()
+    if cookies_file:
+        args += ["--cookies", cookies_file]
+    if args:
+        print(f"[yt-dlp auth] forwarding: {' '.join(args)}")
+    else:
+        print("[yt-dlp auth] no cookies configured (YTDLP_COOKIES_FROM_BROWSER / YTDLP_COOKIES unset)")
+    return args
+
 def ytdlp(url: str, out: str):
-    subprocess.check_call(["yt-dlp", "-f", "bestaudio/best", "-o", out, url])
+    subprocess.check_call(
+        ["yt-dlp", "-f", "bestaudio/best", "-o", out, *_ytdlp_auth_args(), url]
+    )
 
 def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])

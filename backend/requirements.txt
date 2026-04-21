@@ -14,5 +14,7 @@ torchvision
 transformers>=4.41,<4.50
 spacy
 bertopic
-einops 
+einops
 timm
+sentencepiece
+protobuf
