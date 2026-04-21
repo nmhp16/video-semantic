@@ -1,14 +1,19 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
-import { Search, Plus, X } from 'lucide-react'
-import { ModeSelector } from '@/components/ModeSelector'
-import { FilterPanel } from '@/components/FilterPanel'
-import { ResultCard } from '@/components/ResultCard'
-import { IngestModal } from '@/components/IngestModal'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Plus, Search, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
+import { FilterPanel } from '@/components/FilterPanel'
+import { IngestModal } from '@/components/IngestModal'
+import { ModeSelector } from '@/components/ModeSelector'
+import { ResultCard } from '@/components/ResultCard'
 import { api } from '@/lib/api'
-import type { SearchMode, SearchScope, UnifiedSearchHit, VideoMeta } from '@/lib/api'
+import type {
+  SearchMode,
+  SearchScope,
+  UnifiedSearchHit,
+  VideoMeta,
+} from '@/lib/api'
 
 function ChainStepsInput({
   steps,
@@ -29,21 +34,26 @@ function ChainStepsInput({
   }
 
   return (
-    <div className="space-y-2">
-      <p className="text-xs text-vs-muted font-medium">Action sequence (in order)</p>
+    <div className="rounded-lg border border-border bg-surface/40 p-3 space-y-2">
+      <p className="text-xxs font-medium uppercase tracking-wide text-subtle">
+        Action sequence
+      </p>
       {steps.map((step, i) => (
-        <div key={i} className="flex gap-2 items-center">
-          <span className="flex-shrink-0 text-xs text-vs-subtle w-4 text-right">{i + 1}.</span>
+        <div key={i} className="flex items-center gap-2">
+          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-sm bg-surface2 font-mono text-xxs text-muted">
+            {i + 1}
+          </span>
           <Input
-            placeholder={`Step ${i + 1} — e.g. "person picks up cup"`}
+            placeholder={`Step ${i + 1}`}
             value={step}
             onChange={(e) => updateStep(i, e.target.value)}
-            className="h-8 text-xs"
+            className="h-8 text-sm"
           />
           {steps.length > 1 && (
             <button
               onClick={() => removeStep(i)}
-              className="flex-shrink-0 text-vs-muted hover:text-red-400 transition-colors"
+              className="flex-shrink-0 rounded-md p-1 text-subtle hover:text-red-400 hover:bg-surface2 transition-colors"
+              aria-label="Remove step"
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -52,18 +62,26 @@ function ChainStepsInput({
       ))}
       <button
         onClick={addStep}
-        className="text-xs text-vs-accent-light hover:text-vs-accent transition-colors flex items-center gap-1"
+        className="inline-flex items-center gap-1 text-xs text-muted hover:text-fg transition-colors"
       >
-        <Plus className="h-3 w-3" /> Add step
+        <Plus className="h-3 w-3" />
+        Add step
       </button>
     </div>
   )
 }
 
+const PLACEHOLDERS: Record<SearchMode, string> = {
+  text: 'Search transcripts…',
+  visual: 'Describe a scene or object…',
+  action: 'Describe an action or activity…',
+  action_chain: 'Describe each step in order…',
+}
+
 export function SearchPage() {
   const [query, setQuery] = useState('')
-  const [mode, setMode] = useState<SearchMode>('text')
-  const [scope, setScope] = useState<SearchScope>('global')
+  const [mode, setMode] = useState<SearchMode>('visual')
+  const [scope, setScope] = useState<SearchScope>('video')
   const [selectedVideo, setSelectedVideo] = useState('')
   const [filterObjects, setFilterObjects] = useState('')
   const [chainSteps, setChainSteps] = useState([''])
@@ -79,17 +97,27 @@ export function SearchPage() {
     try {
       const res = await api.getVideos()
       setVideos(res.videos)
-      if (res.videos.length > 0 && !selectedVideo) {
-        setSelectedVideo(res.videos[0].video_id)
-      }
+      setSelectedVideo((prev) => prev || res.videos[0]?.video_id || '')
     } catch {
-      // silently fail — backend may not be running
+      /* backend may not be running */
     }
-  }, [selectedVideo])
+  }, [])
 
   useEffect(() => {
     fetchVideos()
   }, [fetchVideos])
+
+  // Keyboard shortcut: Cmd/Ctrl+K to focus search
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        inputRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   const handleSearch = useCallback(async () => {
     const isChain = mode === 'action_chain'
@@ -112,7 +140,7 @@ export function SearchPage() {
         video_id: scope === 'video' ? selectedVideo : undefined,
         filter_objects: filterObjects.trim() || undefined,
         steps: effectiveSteps,
-        k: 50,
+        k: 24,
         ingest_if_needed: false,
       })
       setHits(res.hits)
@@ -124,10 +152,6 @@ export function SearchPage() {
     }
   }, [query, mode, scope, selectedVideo, filterObjects, chainSteps])
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') handleSearch()
-  }
-
   const handleModeChange = (m: SearchMode) => {
     setMode(m)
     setHits([])
@@ -135,47 +159,47 @@ export function SearchPage() {
   }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col py-6 gap-5">
       {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 border-b border-white/7 flex-shrink-0">
+      <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-lg font-semibold text-vs-text">Search</h1>
-          <p className="text-xs text-vs-muted">{videos.length} video{videos.length !== 1 ? 's' : ''} indexed</p>
+          <h1 className="text-xl font-semibold text-fg tracking-tight">Search</h1>
+          <p className="mt-0.5 text-xs text-muted">
+            {videos.length} video{videos.length !== 1 ? 's' : ''} indexed
+          </p>
         </div>
-        <Button variant="default" size="sm" onClick={() => setIngestOpen(true)}>
-          <Plus className="h-4 w-4" />
-          Add Video
+        <Button variant="primary" size="sm" onClick={() => setIngestOpen(true)}>
+          <Plus className="h-3.5 w-3.5" />
+          Add video
         </Button>
       </div>
 
-      {/* Search area */}
-      <div className="flex-shrink-0 px-6 pt-5 pb-4 space-y-3 border-b border-white/7">
+      {/* Search input area */}
+      <div className="space-y-3">
         {mode !== 'action_chain' ? (
           <div className="flex gap-2">
             <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-vs-muted pointer-events-none" />
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-subtle pointer-events-none" />
               <input
                 ref={inputRef}
-                className="w-full h-11 pl-10 pr-4 rounded-lg border border-white/8 bg-vs-surface-2 text-sm text-vs-text placeholder:text-vs-muted focus:outline-none focus:border-vs-accent/50 focus:ring-1 focus:ring-vs-accent/20 transition-colors"
-                placeholder={
-                  mode === 'text' ? 'Search by transcript…'
-                  : mode === 'visual' ? 'Describe a scene or object…'
-                  : 'Describe an action or activity…'
-                }
+                className="w-full h-11 pl-10 pr-20 rounded-lg border border-border bg-surface text-sm text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
+                placeholder={PLACEHOLDERS[mode]}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                autoFocus
+                onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
               />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 pointer-events-none">
+                <span className="kbd">⌘</span>
+                <span className="kbd">K</span>
+              </span>
             </div>
             <Button
-              variant="default"
-              size="md"
-              className="h-11 px-5"
+              variant="primary"
+              size="lg"
               onClick={handleSearch}
               disabled={loading || !query.trim()}
             >
-              {loading ? <Spinner size="sm" /> : <Search className="h-4 w-4" />}
+              {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
               Search
             </Button>
           </div>
@@ -183,18 +207,21 @@ export function SearchPage() {
           <div className="space-y-3">
             <ChainStepsInput steps={chainSteps} onChange={setChainSteps} />
             <Button
-              variant="default"
+              variant="primary"
               size="md"
               onClick={handleSearch}
               disabled={loading || chainSteps.filter(Boolean).length === 0}
             >
-              {loading ? <Spinner size="sm" /> : <Search className="h-4 w-4" />}
-              Find Sequence
+              {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
+              Find sequence
             </Button>
           </div>
         )}
 
-        <ModeSelector value={mode} onChange={handleModeChange} />
+        <div className="flex flex-wrap items-center gap-2">
+          <ModeSelector value={mode} onChange={handleModeChange} />
+          <div className="flex-1" />
+        </div>
 
         <FilterPanel
           videos={videos}
@@ -207,50 +234,57 @@ export function SearchPage() {
         />
       </div>
 
+      <div className="divider" />
+
       {/* Results */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
+      <div>
         {loading && (
-          <div className="flex flex-col items-center justify-center py-24 gap-4">
-            <Spinner size="lg" />
-            <p className="text-sm text-vs-muted">Searching{mode === 'action_chain' ? ' for sequence' : ''}…</p>
+          <div className="flex flex-col items-center justify-center py-24 gap-3">
+            <Spinner size="lg" className="text-accent" />
+            <p className="text-xs text-muted">
+              {mode === 'action_chain' ? 'Solving sequence…' : 'Searching…'}
+            </p>
           </div>
         )}
 
         {error && !loading && (
-          <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3">
-            <p className="text-sm font-medium text-red-400">Error</p>
-            <p className="text-xs text-vs-muted mt-1">{error}</p>
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2.5">
+            <p className="text-sm font-medium text-red-400">Request failed</p>
+            <p className="mt-0.5 text-xs text-muted break-all">{error}</p>
           </div>
         )}
 
         {!loading && !error && searched && hits.length === 0 && (
           <div className="flex flex-col items-center justify-center py-24 text-center">
-            <div className="h-14 w-14 rounded-2xl bg-vs-surface-2 border border-white/7 flex items-center justify-center mb-4">
-              <Search className="h-6 w-6 text-vs-subtle" />
-            </div>
-            <h3 className="text-base font-semibold text-vs-text mb-1">No results</h3>
-            <p className="text-sm text-vs-muted">Try a different query or switch search mode.</p>
+            <h3 className="text-sm font-semibold text-fg">No results</h3>
+            <p className="mt-1 text-xs text-muted">
+              Try a different query or switch search mode.
+            </p>
           </div>
         )}
 
         {!loading && !error && !searched && (
           <div className="flex flex-col items-center justify-center py-24 text-center">
-            <div className="h-14 w-14 rounded-2xl bg-gradient-accent flex items-center justify-center mb-4 shadow-glow">
-              <Search className="h-6 w-6 text-white" />
+            <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-md bg-surface2 border border-border">
+              <Search className="h-4 w-4 text-muted" />
             </div>
-            <h3 className="text-base font-semibold text-vs-text mb-1">Search your videos</h3>
-            <p className="text-sm text-vs-muted max-w-xs">
-              Find moments by text transcript, visual scene, or action across your entire video library.
+            <h3 className="text-sm font-semibold text-fg">
+              Search your video library
+            </h3>
+            <p className="mt-1 max-w-xs text-xs text-muted">
+              Find moments by transcript, visual scene, or action.
+              Press <span className="kbd ml-0.5 mr-0.5">⌘</span>
+              <span className="kbd">K</span> to focus the search box.
             </p>
           </div>
         )}
 
         {!loading && hits.length > 0 && (
           <div>
-            <p className="text-xs text-vs-muted mb-4">
+            <p className="mb-3 text-xs text-muted">
               {hits.length} result{hits.length !== 1 ? 's' : ''}
             </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
               {hits.map((hit, i) => (
                 <ResultCard key={`${hit.video_id}-${hit.start}-${i}`} hit={hit} index={i} />
               ))}

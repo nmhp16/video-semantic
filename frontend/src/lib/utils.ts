@@ -16,9 +16,10 @@ export function formatTimeRange(start: number, end: number): string {
 }
 
 export function scorePercent(score: number): number {
-  // FAISS inner-product scores for normalized embeddings are in [-1, 1]
-  // Convert to 0–100 percentage
-  return Math.round(Math.max(0, Math.min(1, (score + 1) / 2)) * 100)
+  // Scores are cosine similarities on normalized embeddings. Most relevant
+  // hits land in [0.1, 0.8] depending on the backbone (SigLIP vs bge).
+  // Report the raw cosine as a percentage, clamped to [0, 100].
+  return Math.round(Math.max(0, Math.min(1, score)) * 100)
 }
 
 export function isYouTubeId(videoId: string): boolean {

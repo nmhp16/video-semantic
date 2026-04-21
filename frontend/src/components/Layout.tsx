@@ -1,29 +1,27 @@
 import { NavLink } from 'react-router-dom'
-import { Search, Film, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ReactNode } from 'react'
 
-interface NavItemProps {
-  to: string
-  icon: ReactNode
-  label: string
-}
-
-function NavItem({ to, icon, label }: NavItemProps) {
+function NavTab({ to, label }: { to: string; label: string }) {
   return (
     <NavLink
       to={to}
+      end={to === '/'}
       className={({ isActive }) =>
         cn(
-          'group flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150',
-          isActive
-            ? 'bg-vs-accent/15 text-vs-accent-light border border-vs-accent/20'
-            : 'text-vs-muted hover:text-vs-text hover:bg-white/5'
+          'relative inline-flex items-center h-9 px-3 text-sm font-medium rounded-md transition-colors duration-100',
+          isActive ? 'text-fg' : 'text-muted hover:text-fg',
         )
       }
     >
-      <span className="flex-shrink-0">{icon}</span>
-      <span>{label}</span>
+      {({ isActive }) => (
+        <>
+          {label}
+          {isActive && (
+            <span className="absolute inset-x-2 -bottom-[13px] h-px bg-fg" aria-hidden="true" />
+          )}
+        </>
+      )}
     </NavLink>
   )
 }
@@ -34,36 +32,36 @@ interface LayoutProps {
 
 export function Layout({ children }: LayoutProps) {
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-vs-bg">
-      {/* Sidebar */}
-      <aside className="flex w-60 flex-shrink-0 flex-col border-r border-white/7 bg-vs-surface/40 backdrop-blur-sm">
-        {/* Logo */}
-        <div className="flex items-center gap-2.5 px-4 py-5 border-b border-white/7">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-accent shadow-glow-sm">
-            <Zap className="h-4 w-4 text-white" fill="white" />
-          </div>
-          <div>
-            <span className="text-sm font-semibold text-vs-text">VideoSearch</span>
-            <p className="text-xs text-vs-muted">Semantic AI</p>
+    <div className="flex flex-col w-full min-h-svh bg-bg">
+      {/* Top bar */}
+      <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
+        <div className="mx-auto flex h-12 max-w-[1400px] items-center gap-6 px-5">
+          {/* Brand */}
+          <NavLink to="/" end className="flex items-center gap-2 mr-2">
+            <div className="flex h-6 w-6 items-center justify-center rounded-[5px] bg-accent/90">
+              <div className="h-2 w-2 rounded-[1px] bg-white" />
+            </div>
+            <span className="text-sm font-semibold text-fg tracking-tight">VideoSearch</span>
+          </NavLink>
+
+          {/* Tabs */}
+          <nav className="flex items-center gap-1">
+            <NavTab to="/" label="Search" />
+            <NavTab to="/library" label="Library" />
+          </nav>
+
+          <div className="flex-1" />
+
+          {/* Right side meta */}
+          <div className="hidden sm:flex items-center gap-2 text-xxs text-subtle">
+            <span>SigLIP ↔ Whisper ↔ Florence-2</span>
           </div>
         </div>
+      </header>
 
-        {/* Nav */}
-        <nav className="flex-1 px-3 py-4 space-y-1">
-          <NavItem to="/" icon={<Search className="h-4 w-4" />} label="Search" />
-          <NavItem to="/library" icon={<Film className="h-4 w-4" />} label="Library" />
-        </nav>
-
-        {/* Footer */}
-        <div className="px-4 py-3 border-t border-white/7">
-          <p className="text-xs text-vs-subtle">4 search modes</p>
-          <p className="text-xs text-vs-subtle">Text · Visual · Action · Chain</p>
-        </div>
-      </aside>
-
-      {/* Main */}
-      <main className="flex flex-1 flex-col overflow-hidden">
-        {children}
+      {/* Content */}
+      <main className="flex-1 w-full">
+        <div className="mx-auto w-full max-w-[1400px] px-5">{children}</div>
       </main>
     </div>
   )

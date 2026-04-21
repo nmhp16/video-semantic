@@ -1,10 +1,18 @@
 import { useState } from 'react'
-import { ExternalLink, Clock, Play } from 'lucide-react'
+import { ExternalLink, Play } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
+import { VideoPlayer } from '@/components/VideoPlayer'
 import { api } from '@/lib/api'
-import { formatTimeRange, scorePercent, isYouTubeId, youtubeUrl, truncate } from '@/lib/utils'
+import {
+  formatTimeRange,
+  scorePercent,
+  isYouTubeId,
+  youtubeUrl,
+  truncate,
+} from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import type { UnifiedSearchHit } from '@/lib/api'
 
 interface ResultCardProps {
@@ -12,169 +20,204 @@ interface ResultCardProps {
   index: number
 }
 
-function FrameImage({ framePath }: { framePath: string }) {
+function FrameThumb({ framePath }: { framePath: string }) {
   const [failed, setFailed] = useState(false)
   const src = api.frameUrl(framePath)
-
   if (failed) {
     return (
-      <div className="w-full aspect-video bg-vs-surface-3 flex items-center justify-center rounded-t-card">
-        <Play className="h-8 w-8 text-vs-subtle" />
+      <div className="w-full aspect-video bg-surface2 flex items-center justify-center">
+        <Play className="h-6 w-6 text-dim" />
       </div>
     )
   }
-
   return (
     <img
       src={src}
-      alt="frame"
+      alt=""
       onError={() => setFailed(true)}
-      className="w-full aspect-video object-cover rounded-t-card"
+      loading="lazy"
+      className="w-full aspect-video object-cover"
     />
   )
 }
 
+function ScorePill({ pct }: { pct: number }) {
+  const tone =
+    pct >= 60
+      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+      : pct >= 40
+        ? 'bg-accent-soft text-accent border-accent/20'
+        : 'bg-surface2 text-muted border-border'
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[10px] leading-none',
+        tone,
+      )}
+    >
+      {pct}%
+    </span>
+  )
+}
+
 export function ResultCard({ hit, index }: ResultCardProps) {
-  const [jumpOpen, setJumpOpen] = useState(false)
+  const [open, setOpen] = useState(false)
   const pct = scorePercent(hit.score)
   const isYT = isYouTubeId(hit.video_id)
   const hasFrame = Boolean(hit.frame)
+  const hasCaption = Boolean(hit.caption && hit.caption.trim())
+  const hasText = Boolean(hit.text && hit.text.trim())
+  const primaryText = hasText ? hit.text : hasCaption ? hit.caption : null
 
   return (
     <>
-      <div
-        className="group glass-card overflow-hidden hover:border-white/12 hover:shadow-card-hover transition-all duration-200 animate-slide-up"
-        style={{ animationDelay: `${index * 30}ms` }}
+      <article
+        className="group rounded-lg border border-border bg-panel overflow-hidden transition-colors duration-150 hover:border-border-strong animate-slide-up cursor-pointer"
+        style={{ animationDelay: `${Math.min(index, 20) * 20}ms` }}
+        onClick={() => setOpen(true)}
       >
-        {/* Frame thumbnail */}
-        {hasFrame ? (
-          <FrameImage framePath={hit.frame!} />
-        ) : (
-          <div className="w-full aspect-video bg-vs-surface-3 flex items-center justify-center">
-            <div className="text-center">
-              <Clock className="h-6 w-6 text-vs-subtle mx-auto mb-1" />
-              <span className="text-xs text-vs-subtle">{formatTimeRange(hit.start, hit.end)}</span>
+        {/* Media */}
+        <div className="relative">
+          {hasFrame ? (
+            <FrameThumb framePath={hit.frame!} />
+          ) : (
+            <div className="w-full aspect-video bg-surface2 flex items-center justify-center">
+              <span className="font-mono text-xs text-dim">
+                {formatTimeRange(hit.start, hit.end)}
+              </span>
+            </div>
+          )}
+
+          {/* Overlay: score + play button */}
+          <div className="absolute inset-0 flex items-end justify-between p-2 bg-gradient-to-t from-black/60 via-transparent to-transparent">
+            <div className="inline-flex items-center gap-1.5">
+              <span className="inline-flex items-center gap-1 rounded-md bg-black/50 px-1.5 py-0.5 font-mono text-[10px] text-white backdrop-blur-sm">
+                {formatTimeRange(hit.start, hit.end)}
+              </span>
+            </div>
+            <ScorePill pct={pct} />
+          </div>
+
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/95 shadow-lg">
+              <Play className="h-4 w-4 text-black translate-x-[1px]" fill="currentColor" />
             </div>
           </div>
-        )}
+        </div>
 
-        {/* Card body */}
-        <div className="p-3 space-y-2.5">
-          {/* Timestamp + score row */}
-          <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1 text-xs font-medium text-vs-muted">
-              <Clock className="h-3 w-3" />
-              {formatTimeRange(hit.start, hit.end)}
-            </span>
-            <span className="text-xs font-semibold text-vs-accent-light">{pct}%</span>
+        {/* Body */}
+        <div className="p-3 space-y-2">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <span className="font-mono text-subtle truncate">{hit.video_id}</span>
+            {isYT && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  window.open(youtubeUrl(hit.video_id, hit.start), '_blank')
+                }}
+                title="Open in YouTube"
+                className="flex-shrink-0 p-1 -m-1 text-subtle hover:text-fg transition-colors"
+              >
+                <ExternalLink className="h-3 w-3" />
+              </button>
+            )}
           </div>
 
-          {/* Score bar */}
-          <div className="w-full bg-vs-surface-3 rounded-full h-0.5">
-            <div className="score-bar h-0.5" style={{ width: `${pct}%` }} />
-          </div>
-
-          {/* Video ID */}
-          <p className="text-xs text-vs-subtle font-mono truncate">{hit.video_id}</p>
-
-          {/* Transcript text */}
-          {hit.text && (
-            <p className="text-xs text-vs-text leading-relaxed line-clamp-3">
-              "{truncate(hit.text, 160)}"
+          {primaryText && (
+            <p
+              className={cn(
+                'text-sm leading-snug line-clamp-3',
+                hasText ? 'text-fg' : 'text-fg/90',
+              )}
+            >
+              {hasText ? `"${truncate(primaryText!, 180)}"` : truncate(primaryText!, 180)}
             </p>
           )}
 
-          {/* Object badges */}
           {hit.objects && hit.objects.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {hit.objects.slice(0, 5).map((obj) => (
-                <Badge key={obj} variant="secondary" className="text-[10px] px-1.5 py-0">
+            <div className="flex flex-wrap gap-1 pt-0.5">
+              {hit.objects.slice(0, 4).map((obj) => (
+                <Badge key={obj} variant="neutral" className="text-[10px] px-1.5 py-0">
                   {obj}
                 </Badge>
               ))}
-              {hit.objects.length > 5 && (
+              {hit.objects.length > 4 && (
                 <Badge variant="outline" className="text-[10px] px-1.5 py-0">
-                  +{hit.objects.length - 5}
+                  +{hit.objects.length - 4}
                 </Badge>
               )}
             </div>
           )}
-
-          {/* Actions */}
-          <div className="flex gap-2 pt-0.5">
-            <Button
-              variant="outline"
-              size="sm"
-              className="flex-1 text-xs h-7"
-              onClick={() => setJumpOpen(true)}
-            >
-              <Play className="h-3 w-3" />
-              Jump to
-            </Button>
-            {isYT && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7"
-                onClick={() => window.open(youtubeUrl(hit.video_id, hit.start), '_blank')}
-                title="Open in YouTube"
-              >
-                <ExternalLink className="h-3 w-3" />
-              </Button>
-            )}
-          </div>
         </div>
-      </div>
+      </article>
 
-      {/* Jump to dialog */}
+      {/* Player dialog */}
       <Dialog
-        open={jumpOpen}
-        onOpenChange={setJumpOpen}
-        title={`${hit.video_id}`}
-        description={`${formatTimeRange(hit.start, hit.end)} · Score ${pct}%`}
-        className="max-w-2xl"
+        open={open}
+        onOpenChange={setOpen}
+        title={hit.video_id}
+        description={`${formatTimeRange(hit.start, hit.end)} · ${pct}% match`}
+        className="w-[min(94vw,820px)]"
       >
         <div className="space-y-4">
-          {hasFrame && (
-            <img
-              src={api.frameUrl(hit.frame!)}
-              alt="frame"
-              className="w-full rounded-lg border border-white/7"
-              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+          {open && (
+            <VideoPlayer
+              videoId={hit.video_id}
+              startSeconds={hit.start}
+              endSeconds={hit.end}
             />
           )}
 
-          {hit.text && (
-            <div className="rounded-lg bg-vs-surface-2 p-3 border border-white/7">
-              <p className="text-xs text-vs-muted mb-1">Transcript</p>
-              <p className="text-sm text-vs-text leading-relaxed">"{hit.text}"</p>
-            </div>
+          {hasText && (
+            <section>
+              <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
+                Transcript
+              </h3>
+              <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">
+                "{hit.text}"
+              </p>
+            </section>
+          )}
+
+          {hasCaption && (
+            <section>
+              <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
+                Caption
+              </h3>
+              <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">
+                {hit.caption}
+              </p>
+            </section>
           )}
 
           {hit.objects && hit.objects.length > 0 && (
-            <div>
-              <p className="text-xs text-vs-muted mb-2">Detected objects</p>
+            <section>
+              <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
+                Keywords
+              </h3>
               <div className="flex flex-wrap gap-1.5">
                 {hit.objects.map((obj) => (
-                  <Badge key={obj} variant="secondary">{obj}</Badge>
+                  <Badge key={obj} variant="neutral">
+                    {obj}
+                  </Badge>
                 ))}
               </div>
-            </div>
+            </section>
           )}
 
-          <div className="flex gap-2 pt-2">
+          <div className="flex gap-2 pt-1">
             {isYT && (
               <Button
-                variant="default"
+                variant="secondary"
                 size="md"
                 className="flex-1"
                 onClick={() => window.open(youtubeUrl(hit.video_id, hit.start), '_blank')}
               >
                 <ExternalLink className="h-4 w-4" />
-                Open in YouTube at {formatTimeRange(hit.start, hit.end)}
+                Open on YouTube at {formatTimeRange(hit.start, hit.end)}
               </Button>
             )}
-            <Button variant="outline" size="md" onClick={() => setJumpOpen(false)}>
+            <Button variant="primary" size="md" onClick={() => setOpen(false)}>
               Close
             </Button>
           </div>

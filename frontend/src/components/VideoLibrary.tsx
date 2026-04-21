@@ -1,6 +1,6 @@
-import { Film, Type, Eye, Activity } from 'lucide-react'
+import { ExternalLink } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
+import { cn, isYouTubeId, youtubeUrl } from '@/lib/utils'
 import type { VideoMeta } from '@/lib/api'
 
 interface VideoLibraryProps {
@@ -9,88 +9,130 @@ interface VideoLibraryProps {
   onSelect?: (videoId: string) => void
 }
 
-function SkeletonCard() {
+function StatusDot({ active, label }: { active: boolean; label: string }) {
   return (
-    <div className="glass-card p-4 space-y-3">
-      <div className="skeleton h-4 w-3/4 rounded" />
-      <div className="flex gap-2">
-        <div className="skeleton h-5 w-12 rounded-full" />
-        <div className="skeleton h-5 w-14 rounded-full" />
-      </div>
-    </div>
+    <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+      <span
+        className={cn(
+          'w-1.5 h-1.5 rounded-full',
+          active ? 'bg-emerald-400' : 'bg-dim',
+        )}
+      />
+      {label}
+    </span>
   )
 }
 
-function VideoCard({ video, onSelect }: { video: VideoMeta; onSelect?: (id: string) => void }) {
+function SkeletonRow() {
   return (
-    <button
-      onClick={() => onSelect?.(video.video_id)}
-      className={cn(
-        'glass-card p-4 text-left space-y-3 w-full transition-all duration-150',
-        'hover:border-white/12 hover:shadow-card-hover hover:bg-vs-surface-2/80',
-        onSelect && 'cursor-pointer'
-      )}
-    >
-      <div className="flex items-start gap-3">
-        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-vs-accent-muted border border-vs-accent/20">
-          <Film className="h-4 w-4 text-vs-accent-light" />
-        </div>
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-vs-text truncate font-mono">{video.video_id}</p>
-          <p className="text-xs text-vs-muted mt-0.5">
-            {[
-              video.has_text_search,
-              video.has_visual_search,
-              video.has_action_search,
-            ].filter(Boolean).length} / 3 indexes ready
-          </p>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap gap-1.5">
-        <Badge variant={video.has_text_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Type className="h-2.5 w-2.5" />
-          Text
-        </Badge>
-        <Badge variant={video.has_visual_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Eye className="h-2.5 w-2.5" />
-          Visual
-        </Badge>
-        <Badge variant={video.has_action_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Activity className="h-2.5 w-2.5" />
-          Action
-        </Badge>
-      </div>
-    </button>
+    <tr className="border-b border-border">
+      <td className="px-4 py-3"><div className="skeleton h-3 w-32 rounded" /></td>
+      <td className="px-4 py-3"><div className="skeleton h-3 w-48 rounded" /></td>
+      <td className="px-4 py-3"><div className="skeleton h-3 w-16 rounded" /></td>
+      <td className="px-4 py-3"><div className="skeleton h-3 w-6 rounded ml-auto" /></td>
+    </tr>
   )
 }
 
 export function VideoLibrary({ videos, loading, onSelect }: VideoLibraryProps) {
   if (loading) {
     return (
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-        {Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
+      <div className="rounded-lg border border-border bg-panel overflow-hidden">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-border bg-surface/50">
+              <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Video</th>
+              <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Indexes</th>
+              <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Ready</th>
+              <th className="px-4 py-2.5 text-right text-xxs font-medium uppercase tracking-wide text-subtle"> </th>
+            </tr>
+          </thead>
+          <tbody>
+            {Array.from({ length: 4 }).map((_, i) => <SkeletonRow key={i} />)}
+          </tbody>
+        </table>
       </div>
     )
   }
 
   if (videos.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center py-24 text-center">
-        <div className="h-16 w-16 rounded-2xl bg-vs-surface-2 border border-white/7 flex items-center justify-center mb-4">
-          <Film className="h-7 w-7 text-vs-subtle" />
+      <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border py-20 px-6 text-center">
+        <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-md bg-surface2 border border-border">
+          <div className="h-1.5 w-4 rounded-sm bg-dim" />
         </div>
-        <h3 className="text-base font-semibold text-vs-text mb-1">No videos yet</h3>
-        <p className="text-sm text-vs-muted max-w-xs">Add a YouTube video to start indexing and searching.</p>
+        <h3 className="text-sm font-semibold text-fg">No videos yet</h3>
+        <p className="mt-1 text-xs text-muted max-w-xs">
+          Add a YouTube URL to download, transcribe, and build search indexes.
+        </p>
       </div>
     )
   }
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-      {videos.map((video) => (
-        <VideoCard key={video.video_id} video={video} onSelect={onSelect} />
-      ))}
+    <div className="rounded-lg border border-border bg-panel overflow-hidden">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-border bg-surface/50">
+            <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">
+              Video
+            </th>
+            <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">
+              Indexes
+            </th>
+            <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">
+              Status
+            </th>
+            <th className="px-4 py-2.5 text-right text-xxs font-medium uppercase tracking-wide text-subtle"> </th>
+          </tr>
+        </thead>
+        <tbody>
+          {videos.map((v) => {
+            const ready = [v.has_text_search, v.has_visual_search, v.has_action_search].filter(Boolean).length
+            const all = ready === 3
+            return (
+              <tr
+                key={v.video_id}
+                onClick={() => onSelect?.(v.video_id)}
+                className={cn(
+                  'border-b border-border last:border-0 transition-colors',
+                  onSelect && 'cursor-pointer hover:bg-surface/50',
+                )}
+              >
+                <td className="px-4 py-3">
+                  <span className="font-mono text-sm text-fg">{v.video_id}</span>
+                </td>
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-4">
+                    <StatusDot active={v.has_text_search} label="Text" />
+                    <StatusDot active={v.has_visual_search} label="Visual" />
+                    <StatusDot active={v.has_action_search} label="Action" />
+                  </div>
+                </td>
+                <td className="px-4 py-3">
+                  <Badge variant={all ? 'success' : ready > 0 ? 'warning' : 'outline'}>
+                    {ready}/3 ready
+                  </Badge>
+                </td>
+                <td className="px-4 py-3 text-right">
+                  {isYouTubeId(v.video_id) && (
+                    <a
+                      href={youtubeUrl(v.video_id)}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      onClick={(e) => e.stopPropagation()}
+                      className="inline-flex items-center gap-1 text-xs text-subtle hover:text-fg transition-colors"
+                    >
+                      YouTube
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
     </div>
   )
 }

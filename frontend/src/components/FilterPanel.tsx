@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronUp, Globe, Video } from 'lucide-react'
+import { ChevronDown, Globe, Video } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import type { VideoMeta, SearchScope } from '@/lib/api'
@@ -14,6 +14,40 @@ interface FilterPanelProps {
   onFilterObjectsChange: (val: string) => void
 }
 
+function SegmentedScope({
+  scope,
+  onScopeChange,
+}: Pick<FilterPanelProps, 'scope' | 'onScopeChange'>) {
+  return (
+    <div className="inline-flex items-center rounded-lg border border-border bg-surface p-0.5">
+      <button
+        onClick={() => onScopeChange('video')}
+        className={cn(
+          'inline-flex items-center gap-1.5 h-7 px-2.5 text-xs font-medium rounded-md transition-colors',
+          scope === 'video'
+            ? 'bg-surface2 text-fg shadow-[inset_0_0_0_1px_#3F3F46]'
+            : 'text-muted hover:text-fg',
+        )}
+      >
+        <Video className="h-3 w-3" />
+        Single
+      </button>
+      <button
+        onClick={() => onScopeChange('global')}
+        className={cn(
+          'inline-flex items-center gap-1.5 h-7 px-2.5 text-xs font-medium rounded-md transition-colors',
+          scope === 'global'
+            ? 'bg-surface2 text-fg shadow-[inset_0_0_0_1px_#3F3F46]'
+            : 'text-muted hover:text-fg',
+        )}
+      >
+        <Globe className="h-3 w-3" />
+        All
+      </button>
+    </div>
+  )
+}
+
 export function FilterPanel({
   videos,
   selectedVideo,
@@ -25,91 +59,99 @@ export function FilterPanel({
 }: FilterPanelProps) {
   const [open, setOpen] = useState(false)
 
+  const dot = (active: boolean, color: string) =>
+    cn('w-1.5 h-1.5 rounded-full', active ? color : 'bg-dim')
+
   return (
-    <div className="rounded-lg border border-white/7 bg-vs-surface/50">
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center justify-between px-4 py-2.5 text-sm text-vs-muted hover:text-vs-text transition-colors"
-      >
-        <span className="font-medium">Filters</span>
-        {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-      </button>
+    <div className="flex flex-col gap-2">
+      {/* Always-visible controls */}
+      <div className="flex flex-wrap items-center gap-2">
+        <SegmentedScope scope={scope} onScopeChange={onScopeChange} />
 
-      {open && (
-        <div className="border-t border-white/7 px-4 py-4 space-y-4 animate-fade-in">
-          {/* Scope */}
-          <div>
-            <label className="block text-xs font-medium text-vs-muted mb-2">Scope</label>
-            <div className="flex gap-2">
-              <button
-                onClick={() => onScopeChange('video')}
+        {scope === 'video' && (
+          <div className="inline-flex items-center gap-2">
+            <label className="text-xs text-muted">Video</label>
+            {videos.length === 0 ? (
+              <span className="text-xs text-dim italic">none ingested</span>
+            ) : (
+              <select
+                value={selectedVideo}
+                onChange={(e) => onVideoChange(e.target.value)}
                 className={cn(
-                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all',
-                  scope === 'video'
-                    ? 'bg-vs-accent/15 text-vs-accent-light border-vs-accent/30'
-                    : 'border-white/8 text-vs-muted hover:bg-white/5'
+                  'h-7 rounded-md border border-border bg-surface pl-2.5 pr-7 text-xs font-mono text-fg',
+                  'hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring',
+                  'appearance-none bg-[url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%228%22%20height%3D%228%22%20viewBox%3D%220%200%2012%2012%22%3E%3Cpath%20fill%3D%22%23A1A1AA%22%20d%3D%22M6%209L1%204h10z%22%2F%3E%3C%2Fsvg%3E")] bg-no-repeat bg-[right_0.5rem_center]',
                 )}
               >
-                <Video className="h-3 w-3" />
-                Single Video
-              </button>
-              <button
-                onClick={() => onScopeChange('global')}
-                className={cn(
-                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all',
-                  scope === 'global'
-                    ? 'bg-vs-accent/15 text-vs-accent-light border-vs-accent/30'
-                    : 'border-white/8 text-vs-muted hover:bg-white/5'
-                )}
-              >
-                <Globe className="h-3 w-3" />
-                All Videos
-              </button>
-            </div>
+                {videos.map((v) => (
+                  <option key={v.video_id} value={v.video_id}>
+                    {v.video_id}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
+        )}
 
-          {/* Video select */}
-          {scope === 'video' && (
-            <div>
-              <label className="block text-xs font-medium text-vs-muted mb-2">Video</label>
-              {videos.length === 0 ? (
-                <p className="text-xs text-vs-subtle italic">No videos ingested yet</p>
-              ) : (
-                <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
-                  {videos.map((v) => (
-                    <button
-                      key={v.video_id}
-                      onClick={() => onVideoChange(v.video_id)}
-                      className={cn(
-                        'w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs transition-all',
-                        selectedVideo === v.video_id
-                          ? 'bg-vs-accent/15 text-vs-accent-light border border-vs-accent/25'
-                          : 'text-vs-muted hover:bg-white/5 border border-transparent'
-                      )}
-                    >
-                      <span className="truncate font-mono">{v.video_id}</span>
-                      <div className="flex gap-1 flex-shrink-0 ml-2">
-                        {v.has_text_search && <span className="w-1.5 h-1.5 rounded-full bg-vs-accent-light" title="Text" />}
-                        {v.has_visual_search && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Visual" />}
-                        {v.has_action_search && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" title="Action" />}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+        <button
+          onClick={() => setOpen(!open)}
+          className={cn(
+            'inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-xs font-medium transition-colors',
+            open
+              ? 'bg-surface2 text-fg border border-border-strong'
+              : 'text-muted hover:text-fg hover:bg-surface border border-border',
           )}
+        >
+          Filters
+          <ChevronDown className={cn('h-3 w-3 transition-transform', open && 'rotate-180')} />
+        </button>
+      </div>
 
-          {/* Object filter */}
+      {/* Collapsible filter body */}
+      {open && (
+        <div className="rounded-lg border border-border bg-surface/50 p-3 animate-fade-in space-y-3">
           <div>
-            <label className="block text-xs font-medium text-vs-muted mb-2">Filter by object</label>
+            <label className="block text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
+              Filter by keyword
+            </label>
             <Input
-              placeholder="e.g. person, car, laptop"
+              placeholder="person, knife, cutting board"
               value={filterObjects}
               onChange={(e) => onFilterObjectsChange(e.target.value)}
               className="h-8 text-xs"
             />
+            <p className="mt-1 text-xxs text-subtle">
+              Matches words in the lazy-generated caption for each frame.
+            </p>
           </div>
+
+          {scope === 'video' && videos.length > 0 && (
+            <div>
+              <label className="block text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
+                Index status
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {videos
+                  .filter((v) => v.video_id === selectedVideo)
+                  .map((v) => (
+                    <div
+                      key={v.video_id}
+                      className="inline-flex items-center gap-3 text-xs text-muted"
+                    >
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className={dot(v.has_text_search, 'bg-accent')} /> Text
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className={dot(v.has_visual_search, 'bg-emerald-400')} /> Visual
+                      </span>
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className={dot(v.has_action_search, 'bg-amber-400')} /> Action
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

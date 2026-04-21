@@ -11,57 +11,93 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    background-color: #09090B;
   }
 
   body {
     margin: 0;
-    background-color: #08080C;
-    color: #F1F5F9;
-    font-family: 'Inter', system-ui, sans-serif;
+    background-color: #09090B;
+    color: #FAFAFA;
+    font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 20px;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01';
   }
 
   #root {
     min-height: 100svh;
     display: flex;
+    flex-direction: column;
+    width: 100%;
   }
 
-  ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-  }
-  ::-webkit-scrollbar-track {
-    background: transparent;
-  }
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 3px;
+    background: #27272A;
+    border-radius: 8px;
+    border: 2px solid #09090B;
   }
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.18);
+  ::-webkit-scrollbar-thumb:hover { background: #3F3F46; }
+
+  ::selection {
+    background: rgba(59, 130, 246, 0.30);
+    color: #F1F5F9;
+  }
+
+  /* Consistent focus ring */
+  :focus-visible {
+    outline: 2px solid rgba(59, 130, 246, 0.55);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  button,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Disable number input spinners */
+  input[type='number']::-webkit-inner-spin-button,
+  input[type='number']::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 }
 
 @layer components {
-  .glass-card {
-    background: linear-gradient(145deg, #0F0F17, #161622);
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 12px;
+  .hairline {
+    border-color: #27272A;
   }
 
   .skeleton {
-    background: linear-gradient(
-      90deg,
-      #161622 0%,
-      #1C1C2E 50%,
-      #161622 100%
-    );
+    background: linear-gradient(90deg, #18181B 0%, #27272A 50%, #18181B 100%);
     background-size: 200% 100%;
-    animation: shimmer 1.5s infinite;
+    animation: shimmer 1500ms linear infinite;
   }
 
-  .score-bar {
-    background: linear-gradient(90deg, #7C3AED, #A78BFA);
-    border-radius: 9999px;
-    height: 3px;
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    font-family: JetBrains Mono, ui-monospace, monospace;
+    font-size: 10px;
+    font-weight: 500;
+    color: #A1A1AA;
+    background: #27272A;
+    border: 1px solid #3F3F46;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+
+  /* Horizontal divider for sections */
+  .divider {
+    height: 1px;
+    background: #27272A;
   }
 }

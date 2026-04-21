@@ -14,6 +14,7 @@ export interface UnifiedSearchHit {
   text?: string
   frame?: string
   objects?: string[]
+  caption?: string
   video_id: string
 }
 

@@ -4,31 +4,48 @@ export default {
   theme: {
     extend: {
       colors: {
-        'vs-bg': '#08080C',
-        'vs-surface': '#0F0F17',
-        'vs-surface-2': '#161622',
-        'vs-surface-3': '#1C1C2E',
-        'vs-border': 'rgba(255,255,255,0.07)',
-        'vs-border-hover': 'rgba(255,255,255,0.12)',
-        'vs-accent': '#7C3AED',
-        'vs-accent-light': '#A78BFA',
-        'vs-accent-muted': 'rgba(124,58,237,0.15)',
-        'vs-text': '#F1F5F9',
-        'vs-muted': '#64748B',
-        'vs-subtle': '#334155',
+        // Neutral surface scale (Tailwind zinc, referenced directly)
+        bg: '#09090B',
+        panel: '#111113',
+        surface: '#18181B',
+        surface2: '#27272A',
+        border: '#27272A',
+        'border-strong': '#3F3F46',
+        fg: '#FAFAFA',
+        muted: '#A1A1AA',
+        subtle: '#71717A',
+        dim: '#52525B',
+
+        // Single accent — blue-500 on hover shifts to blue-400
+        accent: '#3B82F6',
+        'accent-hover': '#60A5FA',
+        'accent-soft': 'rgba(59, 130, 246, 0.12)',
+        'accent-ring': 'rgba(59, 130, 246, 0.28)',
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
+        sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+        mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+      },
+      fontSize: {
+        xxs: ['11px', { lineHeight: '14px' }],
+        xs: ['12px', { lineHeight: '16px' }],
+        sm: ['13px', { lineHeight: '18px' }],
+        base: ['14px', { lineHeight: '20px' }],
+        lg: ['16px', { lineHeight: '22px' }],
+        xl: ['18px', { lineHeight: '26px' }],
+        '2xl': ['22px', { lineHeight: '28px' }],
       },
       borderRadius: {
-        card: '12px',
-        pill: '9999px',
+        sm: '4px',
+        DEFAULT: '6px',
+        md: '8px',
+        lg: '10px',
+        xl: '12px',
       },
       animation: {
-        'fade-in': 'fadeIn 0.2s ease-out',
-        'slide-up': 'slideUp 0.25s ease-out',
-        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-        'shimmer': 'shimmer 1.5s infinite',
+        'fade-in': 'fadeIn 160ms ease-out',
+        'slide-up': 'slideUp 180ms cubic-bezier(0.16, 1, 0.3, 1)',
+        shimmer: 'shimmer 1500ms linear infinite',
       },
       keyframes: {
         fadeIn: {
@@ -36,24 +53,13 @@ export default {
           '100%': { opacity: '1' },
         },
         slideUp: {
-          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '0%': { opacity: '0', transform: 'translateY(6px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         shimmer: {
           '0%': { backgroundPosition: '-200% 0' },
           '100%': { backgroundPosition: '200% 0' },
         },
-      },
-      backgroundImage: {
-        'gradient-accent': 'linear-gradient(135deg, #7C3AED, #A78BFA)',
-        'gradient-card': 'linear-gradient(145deg, #0F0F17, #161622)',
-        'shimmer-gradient': 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.04) 50%, transparent 100%)',
-      },
-      boxShadow: {
-        'glow': '0 0 20px rgba(124, 58, 237, 0.25)',
-        'glow-sm': '0 0 10px rgba(124, 58, 237, 0.15)',
-        'card': '0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.6)',
-        'card-hover': '0 4px 12px rgba(0,0,0,0.5)',
       },
     },
   },
