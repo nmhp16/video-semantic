@@ -1,4 +1,4 @@
-import os, json, subprocess, tempfile
+import os, json, subprocess, tempfile, shutil
 from typing import List, Dict
 from PIL import Image
 import numpy as np
@@ -6,14 +6,13 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoProcessor, AutoModelForCausalLM
 from store import DATA, save_visual_index, save_action_clips_index
+from supabase_client import sb_enabled
 import re
 from pathlib import Path
 from ingest import extract_audio
 
 MEDIA  = os.path.join(DATA, "media")
 FRAMES = os.path.join(DATA, "frames")
-os.makedirs(MEDIA, exist_ok=True)
-os.makedirs(FRAMES, exist_ok=True)
 
 YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
@@ -74,30 +73,32 @@ class Florence2Captioner:
             model_id, trust_remote_code=True
         ).to(self._device).eval()
 
-    def _run_task(self, image: Image.Image, task: str, max_new_tokens: int = 128) -> dict:
-        inputs = self.processor(text=task, images=image, return_tensors="pt").to(self._device)
-        with torch.no_grad():
-            gen = self.model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=max_new_tokens,
-                num_beams=1,
-                do_sample=False,
-            )
-        text = self.processor.batch_decode(gen, skip_special_tokens=False)[0]
-        return self.processor.post_process_generation(text, task=task, image_size=image.size)
-
-    def process_image(self, image: Image.Image) -> Dict:
-        cap_result = self._run_task(image, "<MORE_DETAILED_CAPTION>", max_new_tokens=128)
-        caption = cap_result.get("<MORE_DETAILED_CAPTION>", "")
-        return {"caption": caption, "objects": _caption_keywords(caption)}
-
-    def process_images(self, pil_images: List[Image.Image]) -> List[Dict]:
+    def process_images(self, pil_images: List[Image.Image], batch_size: int = 8) -> List[Dict]:
+        task = "<MORE_DETAILED_CAPTION>"
         results = []
-        for i, img in enumerate(pil_images):
-            results.append(self.process_image(img))
-            if (i + 1) % 10 == 0:
-                print(f"  captioned {i+1}/{len(pil_images)} frames")
+        for start in range(0, len(pil_images), batch_size):
+            batch = pil_images[start:start + batch_size]
+            inputs = self.processor(
+                text=[task] * len(batch),
+                images=batch,
+                return_tensors="pt",
+                padding=True,
+            ).to(self._device)
+            with torch.no_grad():
+                gen = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    attention_mask=inputs.get("attention_mask"),
+                    max_new_tokens=128,
+                    num_beams=1,
+                    do_sample=False,
+                )
+            texts = self.processor.batch_decode(gen, skip_special_tokens=False)
+            for text, img in zip(texts, batch):
+                parsed  = self.processor.post_process_generation(text, task=task, image_size=img.size)
+                caption = parsed.get(task, "")
+                results.append({"caption": caption, "objects": _caption_keywords(caption)})
+            print(f"  captioned {min(start + batch_size, len(pil_images))}/{len(pil_images)} frames")
         return results
 
 
@@ -126,57 +127,66 @@ def build_caption_windows(frames, embs, captions_data, clip_len=2.0, stride=0.5)
     return np.stack(clip_vecs).astype("float32"), rows
 
 
-def ingest_visual(url_or_path: str, every_sec: float = 1.0):
+def ingest_visual(url_or_path: str, every_sec: float = 2.0):
     m = YT_ID_RE.search(url_or_path)
     video_id = m.group(1) if m else Path(url_or_path).stem
 
-    out_dir       = os.path.join(FRAMES, video_id)
-    wav_handoff   = os.path.join(MEDIA, f"{video_id}.wav")  # temp wav for ingest.py
+    # All working files go into a single tmpdir — no permanent local dirs created
+    with tempfile.TemporaryDirectory() as workdir:
+        out_dir     = os.path.join(workdir, "frames") if sb_enabled() else os.path.join(FRAMES, video_id)
+        wav_handoff = os.path.join(workdir, f"{video_id}.wav")
 
-    if url_or_path.startswith("http"):
-        # Download to a temp file — deleted after processing
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_video = tmp.name
-        try:
-            subprocess.check_call([
-                "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
-                "--extractor-args", "youtube:player_client=android",
-                "-o", tmp_video, url_or_path
-            ])
-            extract_audio(tmp_video, wav_handoff)
-            frames = sample_frames(tmp_video, out_dir, every_sec=every_sec)
-        finally:
-            if os.path.exists(tmp_video):
-                os.remove(tmp_video)  # video not kept
-    else:
-        extract_audio(url_or_path, wav_handoff)
-        frames = sample_frames(url_or_path, out_dir, every_sec=every_sec)
+        def _run(video_path: str):
+            nonlocal frames
+            extract_audio(video_path, wav_handoff)
+            frames = sample_frames(video_path, out_dir, every_sec=every_sec)
 
-    # Caption every frame with Florence-2
-    print(f"Captioning {len(frames)} frames with Florence-2...")
-    captioner    = Florence2Captioner("microsoft/Florence-2-base")
-    pil_images   = [Image.open(f["path"]).convert("RGB") for f in frames]
-    captions_data = captioner.process_images(pil_images)
+        frames = []
 
-    # Embed captions
-    print("Embedding captions...")
-    emb_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    embs = emb_model.encode([cd["caption"] for cd in captions_data], normalize_embeddings=True)
-    embs = np.array(embs, dtype="float32")
+        if url_or_path.startswith("http"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_video = os.path.join(tmpdir, "video.mp4")
+                subprocess.check_call([
+                    "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+                    "--extractor-args", "youtube:player_client=android",
+                    "-o", tmp_video, url_or_path
+                ])
+                _run(tmp_video)
+        else:
+            _run(url_or_path)
 
-    # Action clip index (sliding windows)
-    clip_vecs, clip_rows = build_caption_windows(frames, embs, captions_data)
-    save_action_clips_index(video_id, clip_vecs, clip_rows)
-    print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
+        # Caption every frame with Florence-2
+        print(f"Captioning {len(frames)} frames with Florence-2...")
+        captioner     = Florence2Captioner("microsoft/Florence-2-base")
+        pil_images    = [Image.open(f["path"]).convert("RGB") for f in frames]
+        captions_data = captioner.process_images(pil_images)
 
-    # Visual frame index
-    rows = [{
-        "start":   float(f["t"]),
-        "end":     float(f["t_end"]),
-        "frame":   os.path.relpath(f["path"], start=os.path.dirname(DATA)),
-        "objects": captions_data[i]["objects"],
-        "caption": captions_data[i]["caption"],
-    } for i, f in enumerate(frames)]
+        # Embed captions
+        print("Embedding captions...")
+        emb_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+        embs = emb_model.encode([cd["caption"] for cd in captions_data], normalize_embeddings=True)
+        embs = np.array(embs, dtype="float32")
 
-    save_visual_index(video_id, embs, rows)
-    print(f"VISUAL INGEST OK: {video_id} | frames={len(frames)}")
+        # Action clip index (sliding windows)
+        clip_vecs, clip_rows = build_caption_windows(frames, embs, captions_data)
+        save_action_clips_index(video_id, clip_vecs, clip_rows)
+        print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
+
+        # Visual frame index
+        # abs path when Supabase (tempdir), relative to BASE when local
+        rows = [{
+            "start":   float(f["t"]),
+            "end":     float(f["t_end"]),
+            "frame":   f["path"] if sb_enabled() else os.path.relpath(f["path"], start=BASE),
+            "objects": captions_data[i]["objects"],
+            "caption": captions_data[i]["caption"],
+        } for i, f in enumerate(frames)]
+
+        save_visual_index(video_id, embs, rows)
+        print(f"VISUAL INGEST OK: {video_id} | frames={len(frames)}")
+
+        # Transcribe while wav is still alive inside this workdir
+        from ingest import transcribe as do_transcribe
+        print("Transcribing audio...")
+        segments = do_transcribe(wav_handoff)
+        return segments  # caller passes these to ingest() to skip re-download

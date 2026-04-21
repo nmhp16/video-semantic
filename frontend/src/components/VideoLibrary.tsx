@@ -1,6 +1,8 @@
+import { useState, useEffect } from 'react'
 import { Film, Type, Eye, Activity } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
+import { cn, isYouTubeId } from '@/lib/utils'
+import { fetchVideoTitle, getCachedTitle, ytThumbnail } from '@/lib/youtube'
 import type { VideoMeta } from '@/lib/api'
 
 interface VideoLibraryProps {
@@ -22,44 +24,56 @@ function SkeletonCard() {
 }
 
 function VideoCard({ video, onSelect }: { video: VideoMeta; onSelect?: (id: string) => void }) {
+  const [title, setTitle] = useState(getCachedTitle(video.video_id))
+  const isYT = isYouTubeId(video.video_id)
+
+  useEffect(() => {
+    fetchVideoTitle(video.video_id).then(setTitle)
+  }, [video.video_id])
+
   return (
     <button
       onClick={() => onSelect?.(video.video_id)}
       className={cn(
-        'glass-card p-4 text-left space-y-3 w-full transition-all duration-150',
+        'glass-card overflow-hidden text-left w-full transition-all duration-150',
         'hover:border-white/12 hover:shadow-card-hover hover:bg-vs-surface-2/80',
         onSelect && 'cursor-pointer'
       )}
     >
-      <div className="flex items-start gap-3">
-        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-vs-accent-muted border border-vs-accent/20">
-          <Film className="h-4 w-4 text-vs-accent-light" />
+      {/* Thumbnail */}
+      {isYT ? (
+        <img
+          src={ytThumbnail(video.video_id)}
+          alt={title}
+          className="w-full aspect-video object-cover"
+        />
+      ) : (
+        <div className="w-full aspect-video bg-vs-surface-3 flex items-center justify-center">
+          <Film className="h-7 w-7 text-vs-subtle" />
         </div>
+      )}
+
+      <div className="p-3 space-y-2">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-vs-text truncate font-mono">{video.video_id}</p>
+          <p className="text-sm font-medium text-vs-text truncate">{title}</p>
           <p className="text-xs text-vs-muted mt-0.5">
-            {[
-              video.has_text_search,
-              video.has_visual_search,
-              video.has_action_search,
-            ].filter(Boolean).length} / 3 indexes ready
+            {[video.has_text_search, video.has_visual_search, video.has_action_search].filter(Boolean).length} / 3 indexes ready
           </p>
         </div>
-      </div>
-
-      <div className="flex flex-wrap gap-1.5">
-        <Badge variant={video.has_text_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Type className="h-2.5 w-2.5" />
-          Text
-        </Badge>
-        <Badge variant={video.has_visual_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Eye className="h-2.5 w-2.5" />
-          Visual
-        </Badge>
-        <Badge variant={video.has_action_search ? 'success' : 'secondary'} className="text-[10px]">
-          <Activity className="h-2.5 w-2.5" />
-          Action
-        </Badge>
+        <div className="flex flex-wrap gap-1.5">
+          <Badge variant={video.has_text_search ? 'success' : 'secondary'} className="text-[10px]">
+            <Type className="h-2.5 w-2.5" />
+            Text
+          </Badge>
+          <Badge variant={video.has_visual_search ? 'success' : 'secondary'} className="text-[10px]">
+            <Eye className="h-2.5 w-2.5" />
+            Visual
+          </Badge>
+          <Badge variant={video.has_action_search ? 'success' : 'secondary'} className="text-[10px]">
+            <Activity className="h-2.5 w-2.5" />
+            Action
+          </Badge>
+        </div>
       </div>
     </button>
   )

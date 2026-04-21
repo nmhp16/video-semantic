@@ -27,9 +27,9 @@ export interface UnifiedSearchResponse {
 
 export interface IngestResponse {
   success: boolean
-  message: string
   video_id: string
-  status: 'completed' | 'already_exists'
+  status: 'completed' | 'processing' | 'failed' | 'unknown'
+  error?: string
 }
 
 export type SearchMode = 'text' | 'visual' | 'action'
@@ -70,6 +70,10 @@ export const api = {
     })
   },
 
+  getIngestStatus(video_id: string): Promise<IngestResponse> {
+    return request(`/ingest/status/${encodeURIComponent(video_id)}`)
+  },
+
   query(req: UnifiedSearchRequest): Promise<UnifiedSearchResponse> {
     return request('/query', {
       method: 'POST',
@@ -79,8 +83,7 @@ export const api = {
   },
 
   frameUrl(framePath: string): string {
-    // frames stored as e.g. "data/frames/video_id/frame_0042.jpg"
-    // strip leading "data/frames/" or "frames/" prefix
+    if (framePath.startsWith('http')) return framePath   // Supabase public URL
     const match = framePath.match(/(?:data\/)?frames\/(.+)/)
     const rel = match ? match[1] : framePath
     return `${BASE_URL}/frames/${rel}`

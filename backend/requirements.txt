@@ -1,7 +1,9 @@
 fastapi
+supabase
+python-dotenv
 uvicorn
 yt-dlp
-openai-whisper
+faster-whisper
 sentence-transformers
 faiss-cpu
 pydantic

@@ -6,6 +6,9 @@ from bertopic import BERTopic
 import spacy
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
+from dotenv import load_dotenv
+load_dotenv()
+from supabase_client import sb_enabled
 
 _nlp = None
 def _get_nlp():
@@ -17,8 +20,6 @@ def _get_nlp():
 # --- Paths ---
 BASE = os.path.dirname(__file__)
 DATA = os.path.join(BASE, "data")
-os.makedirs(os.path.join(DATA, "indexes"), exist_ok=True)
-os.makedirs(os.path.join(DATA, "transcripts"), exist_ok=True)
 
 DB_PATH = os.path.join(DATA, "indexes", "meta.sqlite")
 
@@ -123,72 +124,104 @@ def clear_video(video_id: str):
 
 # --- TEXT (ASR) INDEX ---
 def save_index(video_id: str, embeddings: np.ndarray, chunks: list[dict]):
-    # FAISS index
+    # FAISS index (always local — needed for fast vector search)
+    os.makedirs(os.path.join(DATA, "indexes"), exist_ok=True)
     d = embeddings.shape[1]
     index = faiss.IndexFlatIP(d)
     vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
     index.add(vecs.astype('float32'))
     faiss.write_index(index, INDEX_PATH(video_id))
 
-    # Meta json
-    with open(META_PATH(video_id), "w") as f:
-        json.dump({"video_id": video_id, "n": len(chunks)}, f)
-    
-    # SQLite rows
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO chunks(video_id, idx, start, end, text) VALUES(?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["text"]) for i, c in enumerate(chunks)]
-    )
-    conn.commit()
-    conn.close()
+    if sb_enabled():
+        import supabase_store
+        supabase_store.push_chunks(video_id, chunks)
+        supabase_store.push_faiss(video_id, ".faiss", INDEX_PATH(video_id))
+        print(f"  Supabase: pushed text index for {video_id}")
+    else:
+        # Meta json + SQLite only when Supabase is not configured
+        with open(META_PATH(video_id), "w") as f:
+            json.dump({"video_id": video_id, "n": len(chunks)}, f)
+        conn = get_conn()
+        conn.executemany(
+            "INSERT INTO chunks(video_id, idx, start, end, text) VALUES(?, ?, ?, ?, ?)",
+            [(video_id, i, c["start"], c["end"], c["text"]) for i, c in enumerate(chunks)]
+        )
+        conn.commit()
+        conn.close()
 
 def load_index(video_id: str):
+    if not os.path.exists(INDEX_PATH(video_id)):
+        if sb_enabled():
+            import supabase_store
+            supabase_store.pull_faiss(video_id, ".faiss", INDEX_PATH(video_id))
+
     index = faiss.read_index(INDEX_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, text 
-        FROM chunks 
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+
+    if sb_enabled():
+        import supabase_store
+        rows = supabase_store.pull_chunks(video_id)
+    else:
+        conn = get_conn()
+        rows = conn.execute("SELECT idx, start, end, text FROM chunks WHERE video_id=? ORDER BY idx",
+                            (video_id,)).fetchall()
+        conn.close()
+
     return index, rows
 
 # --- VISUAL INDEX ---
 def save_visual_index(video_id: str, embeddings: np.ndarray, chunks: list[dict]):
-    # FAISS index
+    # FAISS index (always local)
+    os.makedirs(os.path.join(DATA, "indexes"), exist_ok=True)
     d = embeddings.shape[1]
     index = faiss.IndexFlatIP(d)
     vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
     index.add(vecs.astype('float32'))
     faiss.write_index(index, VINDEX_PATH(video_id))
 
-    # SQLite rows
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["frame"],
-          json.dumps(c.get("objects", [])), c.get("caption", ""))
-         for i, c in enumerate(chunks)]
-    )
-    conn.commit()
-    conn.close()
+    if sb_enabled():
+        import supabase_store
+        # frame paths are absolute when Supabase is enabled (tempdir)
+        local_paths = [c["frame"] for c in chunks if os.path.exists(c["frame"])]
+        print(f"  Uploading {len(local_paths)} frames to Supabase Storage...")
+        abs_url_map = supabase_store.upload_frames_parallel(video_id, local_paths)
+        url_map = {c["frame"]: abs_url_map[c["frame"]]
+                   for c in chunks if c["frame"] in abs_url_map}
+        supabase_store.push_visual_frames(video_id, chunks, url_map)
+        supabase_store.push_faiss(video_id, ".vfaiss", VINDEX_PATH(video_id))
+        print(f"  Supabase: pushed visual index for {video_id}")
+    else:
+        conn = get_conn()
+        conn.executemany(
+            "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            [(video_id, i, c["start"], c["end"], c["frame"],
+              json.dumps(c.get("objects", [])), c.get("caption", ""))
+             for i, c in enumerate(chunks)]
+        )
+        conn.commit()
+        conn.close()
 
 def load_visual_index(video_id: str):
+    if not os.path.exists(VINDEX_PATH(video_id)):
+        if sb_enabled():
+            import supabase_store
+            supabase_store.pull_faiss(video_id, ".vfaiss", VINDEX_PATH(video_id))
+
     index = faiss.read_index(VINDEX_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, frame, objects, caption
-        FROM visual_chunks
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+
+    if sb_enabled():
+        import supabase_store
+        rows = supabase_store.pull_visual_frames(video_id)
+    else:
+        conn = get_conn()
+        rows = conn.execute("SELECT idx, start, end, frame, objects, caption FROM visual_chunks WHERE video_id=? ORDER BY idx",
+                            (video_id,)).fetchall()
+        conn.close()
+
     return index, rows
 
 # --- ACTION CLIP INDEX ---
 def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list[dict]):
+    os.makedirs(os.path.join(DATA, "indexes"), exist_ok=True)
     d = embeddings.shape[1]
 
     if os.path.exists(ACLIP_PATH(video_id)):
@@ -201,26 +234,39 @@ def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list[di
     index.add(vecs.astype('float32'))
     faiss.write_index(index, ACLIP_PATH(video_id))
 
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
-        [(video_id, i, r["start"], r["end"],
-          json.dumps(r.get("objects", [])), r.get("caption", ""))
-         for i, r in enumerate(rows)]
-    )
-    conn.commit()
-    conn.close()
+    if sb_enabled():
+        import supabase_store
+        supabase_store.push_action_clips(video_id, rows)
+        supabase_store.push_faiss(video_id, ".aclip.faiss", ACLIP_PATH(video_id))
+        print(f"  Supabase: pushed action index for {video_id}")
+    else:
+        conn = get_conn()
+        conn.executemany(
+            "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
+            [(video_id, i, r["start"], r["end"],
+              json.dumps(r.get("objects", [])), r.get("caption", ""))
+             for i, r in enumerate(rows)]
+        )
+        conn.commit()
+        conn.close()
 
 def load_action_clips_index(video_id: str):
+    if not os.path.exists(ACLIP_PATH(video_id)):
+        if sb_enabled():
+            import supabase_store
+            supabase_store.pull_faiss(video_id, ".aclip.faiss", ACLIP_PATH(video_id))
+
     index = faiss.read_index(ACLIP_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, objects, caption
-        FROM visual_clips
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+
+    if sb_enabled():
+        import supabase_store
+        rows = supabase_store.pull_action_clips(video_id)
+    else:
+        conn = get_conn()
+        rows = conn.execute("SELECT idx, start, end, objects, caption FROM visual_clips WHERE video_id=? ORDER BY idx",
+                            (video_id,)).fetchall()
+        conn.close()
+
     return index, rows
 
 # --- VIDEO CONTEXT FUNCTIONS ---

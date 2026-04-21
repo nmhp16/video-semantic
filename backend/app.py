@@ -1,12 +1,20 @@
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import numpy as np, json, os
+import numpy as np, json, os, threading, time as _time
 from sentence_transformers import SentenceTransformer
 from typing import Optional
 from store import load_index, load_visual_index, load_action_clips_index, build_video_context
 from models import VideoIngestRequest, UnifiedSearchRequest, UnifiedSearchHit, UnifiedSearchResponse
 from utils_unified import extract_video_id
+from supabase_client import sb_enabled
+
+# In-memory ingest job tracker  { video_id: {status, error?} }
+_ingest_jobs: dict = {}
+_ingest_lock = threading.Lock()
 
 app = FastAPI()
 app.add_middleware(
@@ -16,8 +24,10 @@ app.add_middleware(
 )
 
 _data_dir = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(os.path.join(_data_dir, "frames"), exist_ok=True)
-app.mount("/frames", StaticFiles(directory=os.path.join(_data_dir, "frames")), name="frames")
+# Only serve local frames when Supabase is not handling frame storage
+if not sb_enabled():
+    os.makedirs(os.path.join(_data_dir, "frames"), exist_ok=True)
+    app.mount("/frames", StaticFiles(directory=os.path.join(_data_dir, "frames")), name="frames")
 
 EMB = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
@@ -51,17 +61,34 @@ def nms_time(hits: list[dict], tol: float = 0.5) -> list[dict]:
 # --------------------
 def list_video_ids_with(ext: str) -> list[str]:
     idx_dir = os.path.join(_data_dir, "indexes")
-    if not os.path.isdir(idx_dir):
-        return []
-    return [fn[:-len(ext)] for fn in os.listdir(idx_dir) if fn.endswith(ext)]
+    local = set()
+    if os.path.isdir(idx_dir):
+        local = {fn[:-len(ext)] for fn in os.listdir(idx_dir) if fn.endswith(ext)}
+    if sb_enabled():
+        try:
+            from supabase_store import list_video_ids as sb_list
+            key = {".faiss": "has_text", ".vfaiss": "has_visual", ".aclip.faiss": "has_action"}.get(ext)
+            if key:
+                local |= {vid for vid, flags in sb_list().items() if flags.get(key)}
+        except Exception as e:
+            print(f"supabase list error: {e}")
+    return list(local)
 
 def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False) -> bool:
     idx_dir = os.path.join(_data_dir, "indexes")
-    checks = []
-    if need_text:   checks.append(f"{video_id}.faiss")
-    if need_visual: checks.append(f"{video_id}.vfaiss")
-    if need_action: checks.append(f"{video_id}.aclip.faiss")
-    return all(os.path.exists(os.path.join(idx_dir, f)) for f in checks)
+    pairs = []
+    if need_text:   pairs.append((f"{video_id}.faiss",       ".faiss"))
+    if need_visual: pairs.append((f"{video_id}.vfaiss",      ".vfaiss"))
+    if need_action: pairs.append((f"{video_id}.aclip.faiss", ".aclip.faiss"))
+    for filename, ext in pairs:
+        local = os.path.join(idx_dir, filename)
+        if not os.path.exists(local) and sb_enabled():
+            from supabase_store import pull_faiss
+            if not pull_faiss(video_id, ext, local):
+                return False
+        elif not os.path.exists(local):
+            return False
+    return True
 
 def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual: bool, need_action: bool):
     from ingest import ingest as do_ingest
@@ -131,46 +158,117 @@ def search_global(mode: str, q: str, k: int, restrict: Optional[list[str]]) -> l
 # Endpoints
 # --------------------
 @app.get("/videos")
-async def list_videos():
+def list_videos():
     idx_dir = os.path.join(_data_dir, "indexes")
-    if not os.path.isdir(idx_dir):
-        return {"videos": []}
-    vids = set()
-    for fn in os.listdir(idx_dir):
-        for ext in (".faiss", ".vfaiss", ".aclip.faiss"):
-            if fn.endswith(ext):
-                vids.add(fn[:-len(ext)])
-    return {"videos": sorted([{
-        "video_id":          vid,
-        "has_text_search":   os.path.exists(os.path.join(idx_dir, f"{vid}.faiss")),
-        "has_visual_search": os.path.exists(os.path.join(idx_dir, f"{vid}.vfaiss")),
-        "has_action_search": os.path.exists(os.path.join(idx_dir, f"{vid}.aclip.faiss")),
-    } for vid in vids], key=lambda x: x["video_id"])}
+    # Local index files
+    meta: dict[str, dict] = {}
+    if os.path.isdir(idx_dir):
+        for fn in os.listdir(idx_dir):
+            for ext, key in ((".faiss", "has_text_search"), (".vfaiss", "has_visual_search"), (".aclip.faiss", "has_action_search")):
+                if fn.endswith(ext):
+                    vid = fn[:-len(ext)]
+                    if vid not in meta:
+                        meta[vid] = {"has_text_search": False, "has_visual_search": False, "has_action_search": False}
+                    meta[vid][key] = True
+    # Merge Supabase
+    if sb_enabled():
+        try:
+            from supabase_store import list_video_ids as sb_list
+            for vid, flags in sb_list().items():
+                if vid not in meta:
+                    meta[vid] = {"has_text_search": False, "has_visual_search": False, "has_action_search": False}
+                if flags.get("has_text"):   meta[vid]["has_text_search"]   = True
+                if flags.get("has_visual"): meta[vid]["has_visual_search"] = True
+                if flags.get("has_action"): meta[vid]["has_action_search"] = True
+        except Exception as e:
+            print(f"supabase /videos error: {e}")
+    return {"videos": sorted([{"video_id": vid, **flags} for vid, flags in meta.items()], key=lambda x: x["video_id"])}
+
+
+def _is_indexed(video_id: str) -> dict[str, bool]:
+    """Check which indexes exist (local + Supabase)."""
+    idx_dir = os.path.join(_data_dir, "indexes")
+    def local(ext): return os.path.exists(os.path.join(idx_dir, f"{video_id}{ext}"))
+    has_text   = local(".faiss")
+    has_visual = local(".vfaiss")
+    has_action = local(".aclip.faiss")
+    if sb_enabled() and not (has_text and has_visual and has_action):
+        try:
+            from supabase_store import list_video_ids as sb_list
+            sb = sb_list()
+            if video_id in sb:
+                flags = sb[video_id]
+                has_text   = has_text   or flags.get("has_text", False)
+                has_visual = has_visual or flags.get("has_visual", False)
+                has_action = has_action or flags.get("has_action", False)
+        except Exception:
+            pass
+    return {"text": has_text, "visual": has_visual, "action": has_action}
+
+
+def _fake_processing(video_id: str, delay: float = 15.0):
+    """Simulate processing for already-indexed videos (demo effect)."""
+    _time.sleep(delay)
+    with _ingest_lock:
+        _ingest_jobs[video_id] = {"status": "completed"}
+
+
+def _run_ingest_job(video_url: str, video_id: str):
+    from ingest import ingest as do_ingest
+    from visual_ingest import ingest_visual as do_visual_ingest
+    try:
+        idx_dir = os.path.join(_data_dir, "indexes")
+        def has_local(ext): return os.path.exists(os.path.join(idx_dir, f"{video_id}{ext}"))
+
+        segments = None
+        if not has_local(".vfaiss") or not has_local(".aclip.faiss"):
+            segments = do_visual_ingest(video_url)
+        if not has_local(".faiss"):
+            do_ingest(video_url, segments=segments)
+        build_video_context(video_id)
+
+        with _ingest_lock:
+            _ingest_jobs[video_id] = {"status": "completed"}
+        print(f"INGEST DONE: {video_id}")
+    except Exception as e:
+        with _ingest_lock:
+            _ingest_jobs[video_id] = {"status": "failed", "error": str(e)}
+        print(f"INGEST FAILED: {video_id}: {e}")
 
 
 @app.post("/ingest")
-async def ingest_video(request: VideoIngestRequest):
-    try:
-        video_url = request.video_url
-        video_id  = request.video_id or extract_video_id(video_url)
-        if not video_id:
-            raise ValueError("Could not extract video ID from URL")
+def ingest_video(request: VideoIngestRequest, background_tasks: BackgroundTasks):
+    video_url = request.video_url
+    video_id  = request.video_id or extract_video_id(video_url)
+    if not video_id:
+        raise HTTPException(400, "Could not extract video ID from URL")
 
-        print(f"Ingesting video: {video_id} from {video_url}")
+    with _ingest_lock:
+        job = _ingest_jobs.get(video_id)
+    if job and job["status"] == "processing":
+        return {"success": True, "video_id": video_id, "status": "processing"}
 
-        if os.path.exists(os.path.join(_data_dir, "indexes", f"{video_id}.faiss")):
-            return {"success": True, "video_id": video_id, "status": "already_exists"}
+    indexed = _is_indexed(video_id)
+    if indexed["text"] and indexed["visual"] and indexed["action"]:
+        # Already done — show fake 15s progress for demo
+        with _ingest_lock:
+            _ingest_jobs[video_id] = {"status": "processing"}
+        background_tasks.add_task(_fake_processing, video_id, 15.0)
+        return {"success": True, "video_id": video_id, "status": "processing"}
 
-        from ingest import ingest as do_ingest
-        from visual_ingest import ingest_visual as do_visual_ingest
-        do_visual_ingest(video_url)  # download video → extract frames → visual + action indexes
-        do_ingest(video_url)         # transcribe audio → text index
-        build_video_context(video_id)
+    with _ingest_lock:
+        _ingest_jobs[video_id] = {"status": "processing"}
+    background_tasks.add_task(_run_ingest_job, video_url, video_id)
+    return {"success": True, "video_id": video_id, "status": "processing"}
 
-        return {"success": True, "video_id": video_id, "status": "completed"}
-    except Exception as e:
-        print(f"Ingestion error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/ingest/status/{video_id}")
+def get_ingest_status(video_id: str):
+    with _ingest_lock:
+        job = _ingest_jobs.get(video_id)
+    if job is None:
+        return {"video_id": video_id, "status": "unknown"}
+    return {"video_id": video_id, **job}
 
 
 @app.post("/query", response_model=UnifiedSearchResponse)
@@ -190,8 +288,15 @@ def unified_query(body: UnifiedSearchRequest):
             raise HTTPException(400, "video_id or video_url required for scope='video'")
 
         need = dict(need_text=mode == "text", need_visual=mode == "visual", need_action=mode == "action")
-        if body.ingest_if_needed and not have_indexes(vid, **need):
-            ensure_ingested(body.video_url or "", vid, **need)
+        if not have_indexes(vid, **need):
+            job = _ingest_jobs.get(vid, {})
+            if job.get("status") == "processing":
+                raise HTTPException(503, f"Video '{vid}' is still being indexed — try again in a moment")
+            if body.ingest_if_needed:
+                ensure_ingested(body.video_url or "", vid, **need)
+            else:
+                ext = {"text": ".faiss", "visual": ".vfaiss", "action": ".aclip.faiss"}[mode]
+                raise HTTPException(404, f"No {mode} index for '{vid}' ({ext} not found)")
 
         raw = _SEARCH_FN[mode](vid, q, k)
 

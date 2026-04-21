@@ -149,8 +149,10 @@ export function SearchPage() {
         )}
 
         {error && !loading && (
-          <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3">
-            <p className="text-sm font-medium text-red-400">Error</p>
+          <div className={`rounded-lg px-4 py-3 border ${error.includes('still being indexed') ? 'bg-amber-500/10 border-amber-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
+            <p className={`text-sm font-medium ${error.includes('still being indexed') ? 'text-amber-400' : 'text-red-400'}`}>
+              {error.includes('still being indexed') ? 'Still indexing…' : 'Error'}
+            </p>
             <p className="text-xs text-vs-muted mt-1">{error}</p>
           </div>
         )}

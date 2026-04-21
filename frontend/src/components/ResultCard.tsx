@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog } from '@/components/ui/dialog'
 import { api } from '@/lib/api'
 import { formatTimeRange, formatTime, scorePercent, isYouTubeId, youtubeUrl, truncate } from '@/lib/utils'
+import { ytThumbnail } from '@/lib/youtube'
 import type { UnifiedSearchHit } from '@/lib/api'
 
 interface ResultCardProps {
@@ -62,24 +63,27 @@ export function ResultCard({ hit, index }: ResultCardProps) {
         style={{ animationDelay: `${index * 30}ms` }}
         onClick={() => setPlayerOpen(true)}
       >
-        {/* Frame thumbnail */}
-        {hasFrame ? (
-          <div className="relative">
+        {/* Thumbnail — frame image, YouTube still, or fallback */}
+        <div className="relative">
+          {hasFrame ? (
             <FrameImage framePath={hit.frame!} />
-            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
-              <div className="opacity-0 group-hover:opacity-100 transition-opacity h-10 w-10 rounded-full bg-white/90 flex items-center justify-center shadow-lg">
-                <Play className="h-4 w-4 text-black ml-0.5" />
-              </div>
+          ) : isYT ? (
+            <img
+              src={ytThumbnail(hit.video_id)}
+              alt="thumbnail"
+              className="w-full aspect-video object-cover rounded-t-card"
+            />
+          ) : (
+            <div className="w-full aspect-video bg-vs-surface-3 flex items-center justify-center">
+              <Clock className="h-6 w-6 text-vs-subtle" />
+            </div>
+          )}
+          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center rounded-t-card">
+            <div className="opacity-0 group-hover:opacity-100 transition-opacity h-10 w-10 rounded-full bg-white/90 flex items-center justify-center shadow-lg">
+              <Play className="h-4 w-4 text-black ml-0.5" />
             </div>
           </div>
-        ) : (
-          <div className="w-full aspect-video bg-vs-surface-3 flex items-center justify-center group-hover:bg-vs-surface-2 transition-colors">
-            <div className="text-center">
-              <Play className="h-6 w-6 text-vs-subtle mx-auto mb-1 group-hover:text-vs-accent-light transition-colors" />
-              <span className="text-xs text-vs-subtle">{formatTimeRange(hit.start, hit.end)}</span>
-            </div>
-          </div>
-        )}
+        </div>
 
         {/* Card body */}
         <div className="p-3 space-y-2.5">
