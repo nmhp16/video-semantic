@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import numpy as np, json, os
 from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any, Callable
@@ -21,6 +22,14 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+_data_dir = os.path.join(os.path.dirname(__file__), "data")
+_frames_dir = os.path.join(_data_dir, "frames")
+_media_dir = os.path.join(_data_dir, "media")
+os.makedirs(_frames_dir, exist_ok=True)
+os.makedirs(_media_dir, exist_ok=True)
+app.mount("/frames", StaticFiles(directory=_frames_dir), name="frames")
+app.mount("/media", StaticFiles(directory=_media_dir), name="media")
 
 EMB = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 CLIP_TXT = SentenceTransformer("clip-ViT-B-32")

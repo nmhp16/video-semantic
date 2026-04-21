@@ -12,5 +12,5 @@ __pycache__/
 *.sqlite-shm
 *.sqlite-wal
 *.pt
-.venv/
+venv/
 *.pyc
