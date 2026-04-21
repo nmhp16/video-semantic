@@ -1,9 +1,10 @@
-import os, json, math, subprocess
+import os, json, subprocess
 from typing import List, Dict
 from PIL import Image
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
-from ultralytics import YOLO
+from transformers import AutoProcessor, AutoModelForCausalLM
 from store import DATA, save_visual_index, save_action_clips_index
 import re
 from pathlib import Path
@@ -45,70 +46,94 @@ def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List
     for i, fn in enumerate(frames):
         t = i * every_sec
         out.append({
-        "path": os.path.join(out_dir, fn), 
-        "t": t, 
+        "path": os.path.join(out_dir, fn),
+        "t": t,
         "t_end": min(duration, (i+1)*every_sec)
         })
-    
+
     return out
 
-# --- CLIP embeddings with SentenceTransformer ---
-class ClipEncoder:
-    def __init__(self, model_name: str = "clip-ViT-B-32"):
-        self.model = SentenceTransformer(model_name)
+# --- Florence-2 captioning + object detection ---
+class Florence2Captioner:
+    def __init__(self, model_id: str = "microsoft/Florence-2-base"):
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=True
+        ).to(self._device).eval()
 
-    def encode_images(self, pil_images: List[Image.Image]) -> np.ndarray:
-        X = self.model.encode(pil_images, normalize_embeddings=True)
-        return np.array(X, dtype="float32")
+    def _run_task(self, image: Image.Image, task: str) -> dict:
+        inputs = self.processor(text=task, images=image, return_tensors="pt").to(self._device)
+        with torch.no_grad():
+            gen = self.model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=256,
+                num_beams=3,
+            )
+        text = self.processor.batch_decode(gen, skip_special_tokens=False)[0]
+        return self.processor.post_process_generation(text, task=task, image_size=image.size)
 
-    def encode_text(self, queries: List[str]) -> np.ndarray:
-        X = self.model.encode(queries, normalize_embeddings=True)
-        return np.array(X, dtype="float32")
-    
-# --- YOLO object detection ---
-class YoloDetector:
-    def __init__(self, mode_name: str = "yolov8n.pt"):
-        self.model = YOLO(mode_name)
+    def process_image(self, image: Image.Image) -> Dict:
+        """Return a detailed caption and object labels for one image."""
+        cap_result = self._run_task(image, "<MORE_DETAILED_CAPTION>")
+        caption = cap_result.get("<MORE_DETAILED_CAPTION>", "")
 
-    def detect_labels(self, image_paths: List[str], conf: float = 0.25) -> List[List[str]]:
-        labels_per_image = []
-        for p in image_paths:
-            res = self.model.predict(p, conf=conf, verbose=False) [0]
-            labels = [res.names[int(c)] for c in (res.boxes.cls.cpu().numpy().tolist() if res.boxes is not None else [])]
-            labels_per_image.append(labels)
+        od_result = self._run_task(image, "<OD>")
+        od_data = od_result.get("<OD>", {})
+        objects = sorted(set(od_data.get("labels", []))) if isinstance(od_data, dict) else []
 
-        return labels_per_image
+        return {"caption": caption, "objects": objects}
 
-def build_clip_windows(frames, embs, labels, clip_len=2.0, stride=0.5):
+    def process_images(self, pil_images: List[Image.Image]) -> List[Dict]:
+        """Process a batch of images sequentially."""
+        results = []
+        for i, img in enumerate(pil_images):
+            results.append(self.process_image(img))
+            if (i + 1) % 10 == 0:
+                print(f"  captioned {i+1}/{len(pil_images)} frames")
+        return results
+
+
+# --- Build sliding-window action clips from caption embeddings ---
+def build_caption_windows(frames, embs, captions_data, clip_len=2.0, stride=0.5):
+    """Build sliding windows using caption embeddings (bge-small space)."""
     i, N = 0, len(frames)
     clip_vecs, rows = [], []
     while i < N:
         t0 = frames[i]["t"]
-        # Collect [t0, t0 + clip_len]
         idxs = []
         j = i
         while j < N and frames[j]["t"] <= t0 + clip_len:
-            idxs.append(j) 
+            idxs.append(j)
             j += 1
         if idxs:
             V = embs[idxs]
             v = V.mean(axis=0)
             v /= (np.linalg.norm(v) + 1e-12)
+
             objs = set()
             for k in idxs:
-                for o in labels[k]:
+                for o in captions_data[k]["objects"]:
                     objs.add(o)
+
+            # Use middle frame's caption as representative
+            mid_idx = idxs[len(idxs) // 2]
+            caption = captions_data[mid_idx]["caption"]
+
             clip_vecs.append(v)
             rows.append({
                 "start": float(frames[idxs[0]]["t"]),
                 "end":   float(frames[idxs[-1]]["t_end"]),
-                "objects": sorted(list(objs))
+                "objects": sorted(list(objs)),
+                "caption": caption,
             })
         # Stride
         t_next = t0 + stride
         while i < N and frames[i]["t"] < t_next:
             i += 1
     return np.stack(clip_vecs, axis=0).astype("float32"), rows
+
 
 def ingest_visual(url_or_path: str, every_sec: float = 1.0):
     # Resolve video_id
@@ -139,30 +164,39 @@ def ingest_visual(url_or_path: str, every_sec: float = 1.0):
 
     if src is None:
         raise FileNotFoundError(f"Could not find video for {video_id}")
-    
+
     out_dir = os.path.join(FRAMES, video_id)
     frames = sample_frames(src, out_dir, every_sec=every_sec)
 
-    # Embeddings
-    enc = ClipEncoder("clip-ViT-B-32")
+    # Caption every frame with Florence-2
+    print(f"Captioning {len(frames)} frames with Florence-2...")
+    captioner = Florence2Captioner("microsoft/Florence-2-base")
     pil_images = [Image.open(f["path"]).convert("RGB") for f in frames]
-    embs = enc.encode_images(pil_images) # NxD
+    captions_data = captioner.process_images(pil_images)
 
-    # Objects
-    det = YoloDetector("yolov8n.pt")
-    labels = det.detect_labels([f["path"] for f in frames])
-    clip_vecs, clip_rows = build_clip_windows(frames, embs, labels, clip_len=2.0, stride=0.5)
+    # Embed captions with bge-small (same space as text/ASR search)
+    print("Embedding captions...")
+    emb_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    caption_texts = [cd["caption"] for cd in captions_data]
+    embs = emb_model.encode(caption_texts, normalize_embeddings=True)
+    embs = np.array(embs, dtype="float32")
+
+    # Action clips (sliding windows over caption embeddings)
+    clip_vecs, clip_rows = build_caption_windows(
+        frames, embs, captions_data, clip_len=2.0, stride=0.5
+    )
     save_action_clips_index(video_id, clip_vecs, clip_rows)
     print(f"ACTION CLIPS OK: {video_id} | clips={len(clip_rows)}")
 
-    # Rows for DB
+    # Rows for visual frame index
     rows = []
     for i, f in enumerate(frames):
         rows.append({
             "start": float(f["t"]),
             "end":   float(f["t_end"]),
-            "frame": os.path.relpath(f["path"], start=os.path.dirname(DATA)), 
-            "objects": labels[i],
+            "frame": os.path.relpath(f["path"], start=os.path.dirname(DATA)),
+            "objects": captions_data[i]["objects"],
+            "caption": captions_data[i]["caption"],
         })
 
     # Store

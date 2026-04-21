@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, json, os
 from sentence_transformers import SentenceTransformer
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any
 from store import (
     load_index, get_conn, load_visual_index, load_action_clips_index,
     filter_videos_by_context, passes_hard_context, build_video_context,
@@ -13,7 +13,6 @@ from models import (
 )
 from utils_unified import extract_video_id
 from gdino import detect_on_image
-from gdino_helper import rerank_with_gdino
 
 app = FastAPI()
 app.add_middleware(
@@ -22,8 +21,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-EMB = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-CLIP_TXT = SentenceTransformer("clip-ViT-B-32")
+EMB = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
 # --------------------
 # Utilities
@@ -98,28 +96,29 @@ def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual:
 def expand_prompt(prompt: str) -> list[str]:
     return [prompt]
 
-def encode_prompt_set(clip_txt_model, prompts: list[str]) -> np.ndarray:
-    X = clip_txt_model.encode(prompts, normalize_embeddings=True).astype('float32')
+def encode_prompt_set(model, prompts: list[str]) -> np.ndarray:
+    X = model.encode(prompts, normalize_embeddings=True).astype('float32')
     v = X.mean(axis=0)
     v /= (np.linalg.norm(v) + 1e-12)
     return v.reshape(1, -1)
 
 def search_action_clips(video_id: str, q: str, k: int, filter_objects: str | None):
     index, rows = load_action_clips_index(video_id)
-    qv = encode_prompt_set(CLIP_TXT, expand_prompt(q))
+    qv = encode_prompt_set(EMB, expand_prompt(q))
     D, I = index.search(qv, k)
     hits = []
     for score, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1: 
+        if idx == -1:
             continue
-        _, start, end, objects_json = rows[idx]
+        _, start, end, objects_json, caption = rows[idx]
         objs = json.loads(objects_json) if objects_json else []
         if filter_objects and (filter_objects not in objs):
             continue
         hits.append({
             "video_id": video_id,
             "start": float(start), "end": float(end),
-            "score": float(score), "objects": objs
+            "score": float(score), "objects": objs,
+            "caption": caption or "",
         })
     hits.sort(key=lambda h: (h["start"], -h["score"]))
     return hits
@@ -216,20 +215,21 @@ def search_text_single(video_id: str, q: str, k: int):
 
 def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str]):
     index, rows = load_visual_index(video_id)
-    qv = CLIP_TXT.encode([q], normalize_embeddings=True).astype('float32')
+    qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
     D, I = index.search(qv, k)
     out = []
     import json as _json
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
         if idx == -1: continue
-        _, start, end, frame, objects = rows[idx]
+        _, start, end, frame, objects, caption = rows[idx]
         objs = _json.loads(objects) if objects else []
         if filter_objects and filter_objects not in objs:
             continue
         out.append({
             "video_id": video_id,
             "start": float(start), "end": float(end),
-            "score": float(s), "frame": frame, "objects": objs
+            "score": float(s), "frame": frame, "objects": objs,
+            "caption": caption or "",
         })
     return out
 
@@ -303,33 +303,37 @@ def _postproc_hits(hits: list[dict], *, key_mode: str, k: int | None) -> list[di
         hits = hits[:k]
     return hits
 
-def _maybe_gdino_fuse(
+def _maybe_caption_rerank(
     hits: list[dict],
     *,
     verify_on: bool,
     prompts: list[str],
     require_all: list[str],
-    box_th: float | None,
-    text_th: float | None,
-    frame_resolver: Callable[[dict], str | None] | None = None,
-    w_clip: float = 0.6,
-    w_gdino: float = 0.4,
+    w_base: float = 0.7,
+    w_caption: float = 0.3,
 ) -> list[dict]:
+    """Rerank hits by checking if captions mention the required terms.
+    No model inference — pure text matching on pre-computed captions."""
     if not (verify_on and prompts and hits):
         return hits
-    topk = min(30, len(hits))
-    cand = hits[:topk]
-    cand = rerank_with_gdino(
-        cand,
-        prompts=prompts,
-        require_all=require_all or [],
-        box_th=box_th,
-        text_th=text_th,
-        w_clip=w_clip,
-        w_gdino=w_gdino,
-        frame_resolver=frame_resolver,
-    )
-    return cand + hits[topk:]
+    terms = [p.strip().lower() for p in prompts if p.strip()]
+    req = [r.strip().lower() for r in (require_all or []) if r.strip()]
+
+    for h in hits:
+        cap = (h.get("caption") or "").lower()
+        if not cap:
+            h["verify_score"] = 0.0
+            h["score_fused"] = w_base * float(h.get("score", 0.0))
+            continue
+        # Score: fraction of prompt terms found in caption
+        matched = sum(1 for t in terms if t in cap)
+        verify = matched / len(terms) if terms else 0.0
+        # Penalize if require_all terms are missing
+        if req and not all(r in cap for r in req):
+            verify *= 0.3
+        h["verify_score"] = verify
+        h["score_fused"] = w_base * float(h.get("score", 0.0)) + w_caption * verify
+    return hits
 
 def _as_unified(h: dict) -> UnifiedSearchHit:
     return UnifiedSearchHit(
@@ -338,6 +342,7 @@ def _as_unified(h: dict) -> UnifiedSearchHit:
         score=float(h.get("score_fused", h.get("score", 0.0))),
         frame=h.get("frame"),
         objects=h.get("objects"),
+        caption=h.get("caption"),
         text=h.get("text"),
         video_id=h.get("video_id"),
     )
@@ -365,20 +370,21 @@ async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, f
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
     
-    qv = CLIP_TXT.encode([q], normalize_embeddings=True).astype('float32')
+    qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
     D, I = index.search(qv, k)
     hits = []
     import json as _json
     for score, idx in zip(D[0].tolist(), I[0].tolist()):
         if idx == -1:
             continue
-        _, start, end, frame, objects = rows[idx]
+        _, start, end, frame, objects, caption = rows[idx]
         objs = _json.loads(objects) if objects else []
         if filter_objects and filter_objects not in objs:
             continue
         hits.append({
             "start": float(start), "end": float(end), "frame": frame,
-            "objects": objs, "score": float(score), "video_id": video_id
+            "objects": objs, "score": float(score), "video_id": video_id,
+            "caption": caption or "",
         })
 
     hits = dedupe_hits(hits, key_mode="auto")
@@ -616,13 +622,11 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- VISUAL (frame-level) ----
         if body.mode == "visual":
             raw = search_visual_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _maybe_gdino_fuse(
+            raw = _maybe_caption_rerank(
                 raw,
-                verify_on=getattr(body, "verify_with_gdino", False),
+                verify_on=body.verify_with_gdino,
                 prompts=body.verify_prompts or [],
                 require_all=body.verify_require_all or [],
-                box_th=body.verify_box_threshold,
-                text_th=body.verify_text_threshold,
             )
             raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
             raw = _postproc_hits(raw, key_mode="auto", k=body.k)
@@ -632,14 +636,11 @@ def unified_query(body: UnifiedSearchRequest):
         # ---- ACTION (segment-level) ----
         if body.mode == "action":
             raw = search_action_single(vid, body.query or "", body.k, body.filter_objects)
-            raw = _maybe_gdino_fuse(
+            raw = _maybe_caption_rerank(
                 raw,
-                verify_on=getattr(body, "verify_with_gdino", False),
+                verify_on=body.verify_with_gdino,
                 prompts=body.verify_prompts or [],
                 require_all=body.verify_require_all or [],
-                box_th=body.verify_box_threshold,
-                text_th=body.verify_text_threshold,
-                frame_resolver=action_frame_resolver,
             )
             raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
@@ -655,14 +656,11 @@ def unified_query(body: UnifiedSearchRequest):
                 vid, body.steps, k_per_step=body.k,
                 max_gap=body.max_gap, filter_objects=body.filter_objects
             )
-            path_hits = _maybe_gdino_fuse(
+            path_hits = _maybe_caption_rerank(
                 path_hits,
-                verify_on=getattr(body, "verify_with_gdino", False),
+                verify_on=body.verify_with_gdino,
                 prompts=body.verify_prompts or [],
                 require_all=body.verify_require_all or [],
-                box_th=body.verify_box_threshold,
-                text_th=body.verify_text_threshold,
-                frame_resolver=action_frame_resolver,
             )
             path_hits.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
             path_hits = _postproc_hits(path_hits, key_mode="time", k=body.k)
@@ -694,13 +692,11 @@ def unified_query(body: UnifiedSearchRequest):
                 filter_objects=body.filter_objects,
                 restrict_videos=restrict
             )
-            raw = _maybe_gdino_fuse(
+            raw = _maybe_caption_rerank(
                 raw,
-                verify_on=getattr(body, "verify_with_gdino", False),
+                verify_on=body.verify_with_gdino,
                 prompts=body.verify_prompts or [],
                 require_all=body.verify_require_all or [],
-                box_th=body.verify_box_threshold,
-                text_th=body.verify_text_threshold,
             )
             raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
             raw = _postproc_hits(raw, key_mode="auto", k=body.k)
@@ -715,14 +711,11 @@ def unified_query(body: UnifiedSearchRequest):
                 restrict_videos=restrict
             )
 
-            raw = _maybe_gdino_fuse(
+            raw = _maybe_caption_rerank(
                 raw,
-                verify_on=getattr(body, "verify_with_gdino", False),
+                verify_on=body.verify_with_gdino,
                 prompts=body.verify_prompts or [],
                 require_all=body.verify_require_all or [],
-                box_th=body.verify_box_threshold,
-                text_th=body.verify_text_threshold,
-                frame_resolver=action_frame_resolver,
             )
             raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
@@ -743,14 +736,11 @@ def unified_query(body: UnifiedSearchRequest):
                         vid, body.steps, k_per_step=body.k,
                         max_gap=body.max_gap, filter_objects=body.filter_objects
                     )
-                    path_hits = _maybe_gdino_fuse(
+                    path_hits = _maybe_caption_rerank(
                         path_hits,
-                        verify_on=getattr(body, "verify_with_gdino", False),
+                        verify_on=body.verify_with_gdino,
                         prompts=body.verify_prompts or [],
                         require_all=body.verify_require_all or [],
-                        box_th=body.verify_box_threshold,
-                        text_th=body.verify_text_threshold,
-                        frame_resolver=action_frame_resolver,
                     )
 
                     # score the path (prefer fused)

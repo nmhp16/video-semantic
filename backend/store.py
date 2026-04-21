@@ -33,7 +33,7 @@ VINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.vfaiss")
 ACLIP_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.aclip.faiss")
 
 # Initialize embedding model for video context
-EMB = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+EMB = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
 # --- SQLite helpers ---
 def get_conn():
@@ -60,9 +60,15 @@ def get_conn():
             end REAL,
             frame TEXT,
             objects TEXT,
+            caption TEXT,
             UNIQUE(video_id, idx) ON CONFLICT REPLACE
-        )             
+        )
     """)
+    # Migration: add caption column to existing tables
+    try:
+        conn.execute("ALTER TABLE visual_chunks ADD COLUMN caption TEXT")
+    except Exception:
+        pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS visual_clips(
@@ -71,9 +77,14 @@ def get_conn():
             start REAL,
             end REAL,
             objects TEXT,
+            caption TEXT,
             UNIQUE(video_id, idx) ON CONFLICT REPLACE
         )
     """)
+    try:
+        conn.execute("ALTER TABLE visual_clips ADD COLUMN caption TEXT")
+    except Exception:
+        pass
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS video_context(
@@ -156,9 +167,10 @@ def save_visual_index(video_id: str, embeddings: np.ndarray, chunks: list[dict])
     # SQLite rows
     conn = get_conn()
     conn.executemany(
-        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects) VALUES(?, ?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["frame"], json.dumps(c.get("objects", []))) 
-        for i, c in enumerate(chunks)]
+        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        [(video_id, i, c["start"], c["end"], c["frame"],
+          json.dumps(c.get("objects", [])), c.get("caption", ""))
+         for i, c in enumerate(chunks)]
     )
     conn.commit()
     conn.close()
@@ -167,8 +179,8 @@ def load_visual_index(video_id: str):
     index = faiss.read_index(VINDEX_PATH(video_id))
     conn = get_conn()
     rows = conn.execute("""
-        SELECT idx, start, end, frame, objects 
-        FROM visual_chunks 
+        SELECT idx, start, end, frame, objects, caption
+        FROM visual_chunks
         WHERE video_id=?
         ORDER BY idx
     """, (video_id,)).fetchall()
@@ -191,8 +203,10 @@ def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list[di
 
     conn = get_conn()
     conn.executemany(
-        "INSERT INTO visual_clips(video_id, idx, start, end, objects) VALUES(?,?,?,?,?)",
-        [(video_id, i, r["start"], r["end"], json.dumps(r.get("objects", []))) for i, r in enumerate(rows)]
+        "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
+        [(video_id, i, r["start"], r["end"],
+          json.dumps(r.get("objects", [])), r.get("caption", ""))
+         for i, r in enumerate(rows)]
     )
     conn.commit()
     conn.close()
@@ -201,8 +215,8 @@ def load_action_clips_index(video_id: str):
     index = faiss.read_index(ACLIP_PATH(video_id))
     conn = get_conn()
     rows = conn.execute("""
-        SELECT idx, start, end, objects 
-        FROM visual_clips 
+        SELECT idx, start, end, objects, caption
+        FROM visual_clips
         WHERE video_id=?
         ORDER BY idx
     """, (video_id,)).fetchall()
@@ -351,7 +365,7 @@ def derive_topics_bertopic(texts: list[str], topn: int = 10, min_topic_size: int
 
     # reuse your global embedding model by passing its name 
     topic_model = BERTopic(min_topic_size=min_topic_size, calculate_probabilities=False, verbose=False,
-                           embedding_model="sentence-transformers/all-MiniLM-L6-v2")
+                           embedding_model="BAAI/bge-small-en-v1.5")
 
     topics, _ = topic_model.fit_transform(texts)
     info = topic_model.get_topic_info()

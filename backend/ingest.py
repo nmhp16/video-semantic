@@ -20,13 +20,13 @@ def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])
 
 def transcribe(wav_path: str):
-    model = whisper.load_model("small") 
+    model = whisper.load_model("turbo")
     result = model.transcribe(wav_path, word_timestamps=False)
     segments = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
     return segments
 
 def embed_texts(texts: list[str]):
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    model = SentenceTransformer("BAAI/bge-small-en-v1.5")
     X = model.encode(texts, normalize_embeddings=True)
     return np.array(X, dtype="float32")
 

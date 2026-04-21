@@ -48,6 +48,7 @@ class UnifiedSearchHit(BaseModel):
     text: Optional[str] = None                 # for text mode
     frame: Optional[str] = None                # for visual mode
     objects: Optional[List[str]] = None        # visual/action modes
+    caption: Optional[str] = None              # visual/action caption from Florence-2
     video_id: str
 
 class UnifiedSearchResponse(BaseModel):
