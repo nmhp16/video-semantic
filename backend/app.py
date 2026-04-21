@@ -531,8 +531,8 @@ async def ingest_video(request: VideoIngestRequest):
         from ingest import ingest as do_ingest
         from visual_ingest import ingest_visual as do_visual_ingest
 
-        do_ingest(video_url)        # text (ASR + embeddings)
-        do_visual_ingest(video_url) # visual (frames + action clips)
+        do_visual_ingest(video_url) # visual first: downloads full video, extracts wav
+        do_ingest(video_url)        # text: reuses wav produced by visual ingest
         
         # Build video context for better search filtering
         build_video_context(video_id)

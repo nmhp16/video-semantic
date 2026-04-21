@@ -1,27 +1,109 @@
-# Video Semantic Search System
+# Video Semantic Search
 
-A powerful multi-modal video search system that allows you to search through videos using text, visual content, and actions. This system can process YouTube videos or local video files and make them searchable using natural language queries.
+A multi-modal video search service. Given a YouTube URL or local video file, the system produces an ASR transcript, per-frame captions, and frame/segment embeddings, then serves text, visual, and action search through a single FastAPI endpoint.
 
-## 🚀 Quick Start
+## Architecture
 
-### 1. Installation
-```bash
-cd backend && pip install -r requirements.txt
+| Component | Model |
+|-----------|-------|
+| Speech-to-text | OpenAI Whisper |
+| Text / caption embeddings | `BAAI/bge-small-en-v1.5` (SentenceTransformers) |
+| Frame captioning and object labels | `microsoft/Florence-2-base` |
+| On-demand open-vocabulary detection | `google/owlv2-base-patch16-ensemble` |
+| Vector index | FAISS (inner product on L2-normalized vectors) |
+| Metadata store | SQLite |
+
+Captions and transcripts share the same embedding space, so text queries and visual queries retrieve against consistent vectors.
+
+## Project Structure
+
+```
+video-semantic/
+  backend/
+    app.py            FastAPI application and search endpoints
+    models.py         Pydantic request/response models
+    ingest.py         Download, audio extraction, Whisper transcription, text index
+    visual_ingest.py  Frame sampling, Florence-2 captioning, caption embedding,
+                      action-clip windows
+    gdino.py          OWLv2 open-vocabulary detector used by /ov_verify
+    store.py          FAISS and SQLite persistence, context filters
+    chunking.py       Transcript chunking utilities
+    utils_unified.py  URL / video-id helpers
+    requirements.txt
+    data/             Runtime artifacts (media, frames, indexes, sqlite)
+  frontend/           Vite + React UI (work in progress)
+  extension/          Browser extension (placeholder)
+  README.md
 ```
 
-### 2. Start the API Server
+## Requirements
+
+- Python 3.10 or newer
+- `ffmpeg` and `ffprobe` on PATH
+- `yt-dlp` (installed by `requirements.txt`)
+- Optional GPU: CUDA for Florence-2 and OWLv2 will be used automatically when available
+
+## Installation
+
 ```bash
+cd backend
+pip install -r requirements.txt
+```
+
+## Running the API
+
+```bash
+cd backend
 uvicorn app:app --reload --port 8000
 ```
 
-### 3. Ingest a Video
+Wait for the log line `Application startup complete` before issuing requests. Model weights are downloaded on first use, so the initial ingest can take several minutes.
+
+## Ingestion
+
+Download, transcribe, sample frames, caption, and build all indexes in one call:
+
 ```bash
-curl -X POST "http://127.0.0.1:8000/ingest" \
+curl -X POST http://127.0.0.1:8000/ingest \
   -H "Content-Type: application/json" \
   -d '{"video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 ```
 
-### 4. Search the Video
+The pipeline:
+
+1. `yt-dlp` downloads the video to `data/media/<video_id>.mp4`.
+2. `ffmpeg` extracts audio to `data/media/<video_id>.wav`.
+3. Whisper produces a transcript; chunks are embedded and written to `data/indexes/<video_id>.faiss`.
+4. `ffmpeg` samples one frame per second into `data/frames/<video_id>/`.
+5. Florence-2 produces a detailed caption and object labels for each frame.
+6. Captions are embedded with `bge-small` and written to `<video_id>.vfaiss`.
+7. Sliding windows over caption embeddings produce action clips in `<video_id>.aclip.faiss`.
+8. A summary context vector is built for cross-video filtering.
+
+List ingested videos and their available indexes:
+
+```bash
+curl http://127.0.0.1:8000/videos
+```
+
+## Unified Query Endpoint
+
+All searches go through `POST /query` with a mode and scope.
+
+### Modes
+
+- `text` — semantic search over transcript chunks.
+- `visual` — frame-level search over caption embeddings.
+- `action` — segment-level search over sliding windows of captions.
+- `action_chain` — ordered sequence of action queries with a maximum inter-step gap.
+
+### Scopes
+
+- `video` (default) — restrict to one video via `video_id` or `video_url`.
+- `global` — search across all ingested videos; optionally restrict with `videos: [...]`.
+
+### Text search
+
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
@@ -33,160 +115,8 @@ curl -X POST http://127.0.0.1:8000/query \
   }'
 ```
 
-## 📁 Project Structure
+### Visual search
 
-```
-video-semantic/
-├── backend/
-│   ├── app.py              # Main FastAPI application
-│   ├── models.py           # Pydantic data models
-│   ├── ingest.py           # Text/audio ingestion pipeline
-│   ├── visual_ingest.py    # Visual content ingestion
-│   ├── gdino.py           # GroundingDINO object detection
-│   ├── gdino_helper.py    # GroundingDINO utilities
-│   ├── store.py           # Database and index management
-│   ├── chunking.py        # Text chunking utilities
-│   ├── utils_unified.py   # General utilities
-│   └── requirements.txt   # Python dependencies
-└── README.md
-```
-
-## 🔧 File-by-File Documentation
-
-### `app.py` - Main API Server
-The core FastAPI application with all search endpoints.
-
-**Key Functions:**
-- `search()` - Basic text search endpoint
-- `vsearch()` - Visual search endpoint  
-- `asearch()` - Action search endpoint
-- `asearch_chain()` - Action chain search endpoint
-- `unified_query()` - Main unified search endpoint supporting all modes
-- `ingest_video()` - Video ingestion endpoint
-- `list_videos()` - List all processed videos
-
-**Search Modes:**
-- `text` - Search through video transcripts
-- `visual` - Search for objects/scenes in video frames
-- `action` - Search for actions in video segments
-- `action_chain` - Search for sequences of related actions
-
-### `models.py` - Data Models
-Pydantic models for API request/response validation.
-
-**Key Models:**
-- `UnifiedSearchRequest` - Main search request model
-- `UnifiedSearchResponse` - Search results model
-- `VideoIngestRequest` - Video ingestion request
-- `SearchHit` - Individual search result
-- `TranscriptSegment` - Audio transcript segment
-
-### `ingest.py` - Text/Audio Processing
-Handles video download, audio extraction, transcription, and text indexing.
-
-**Key Functions:**
-- `ingest(url_or_path)` - Main ingestion function
-- `ytdlp(url, out)` - Download video from YouTube
-- `extract_audio(infile, outfile)` - Extract audio using FFmpeg
-- `transcribe(wav_path)` - Transcribe audio using Whisper
-- `embed_texts(texts)` - Generate text embeddings
-- `chunk_segments(segments)` - Split transcripts into searchable chunks
-
-**Process:**
-1. Download video or use local file
-2. Extract audio track
-3. Transcribe audio using Whisper
-4. Chunk transcript into overlapping segments
-5. Generate embeddings using SentenceTransformer
-6. Store in FAISS index and SQLite database
-
-### `visual_ingest.py` - Visual Content Processing
-Handles frame extraction, visual embeddings, and object detection.
-
-**Key Functions:**
-- `ingest_visual(url_or_path)` - Main visual ingestion
-- `sample_frames(video_path, out_dir)` - Extract frames at regular intervals
-- `ClipEncoder` - CLIP model for visual embeddings
-- `YoloDetector` - YOLO model for object detection
-- `build_clip_windows()` - Create action clips from frames
-
-**Process:**
-1. Download video or use local file
-2. Extract frames every second (configurable)
-3. Generate CLIP embeddings for each frame
-4. Detect objects using YOLO
-5. Create action clips by averaging frame embeddings
-6. Store visual indexes and metadata
-
-### `gdino.py` - Advanced Object Detection
-GroundingDINO integration for precise object detection with text prompts.
-
-**Key Functions:**
-- `detect_on_image(image_path, prompts)` - Detect objects in single image
-- `_caption(prompts)` - Format prompts for GroundingDINO
-
-**Features:**
-- Text-prompted object detection
-- Configurable confidence thresholds
-- Returns bounding boxes and labels
-
-### `gdino_helper.py` - GroundingDINO Utilities
-Helper functions for integrating GroundingDINO with search results.
-
-**Key Functions:**
-- `rerank_with_gdino()` - Re-rank search results using GroundingDINO verification
-
-### `store.py` - Data Storage Management
-Handles FAISS indexes and SQLite database operations.
-
-**Key Functions:**
-- `save_index()` - Save text embeddings to FAISS
-- `load_index()` - Load text search index
-- `save_visual_index()` - Save visual embeddings
-- `load_visual_index()` - Load visual search index
-- `save_action_clips_index()` - Save action clip embeddings
-- `load_action_clips_index()` - Load action search index
-- `get_conn()` - Get SQLite database connection
-- `clear_video()` - Remove all data for a video
-
-**Database Tables:**
-- `chunks` - Text transcript chunks
-- `visual_chunks` - Individual video frames
-- `visual_clips` - Action segments
-
-### `chunking.py` - Text Processing
-Utility for splitting transcripts into searchable chunks.
-
-**Key Functions:**
-- `chunk_segments(segments, max_sec, stride_sec)` - Split transcript into overlapping chunks
-
-### `utils_unified.py` - General Utilities
-Common utility functions.
-
-**Key Functions:**
-- `extract_video_id(video_url)` - Extract YouTube video ID from URL
-
-## 🔍 Search Modes Explained
-
-### 1. Text Search (`mode: "text"`)
-Searches through video transcripts using semantic similarity.
-
-**Example:**
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"text",
-    "query":"never gonna give you up",
-    "k":5
-  }'
-```
-
-### 2. Visual Search (`mode: "visual"`)
-Searches for objects, scenes, or visual content in video frames.
-
-**Example:**
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
@@ -201,16 +131,10 @@ curl -X POST http://127.0.0.1:8000/query \
   }'
 ```
 
-**Parameters:**
-- `filter_objects` - Only show results containing this object
-- `verify_with_gdino` - Use GroundingDINO to verify results
-- `verify_prompts` - Objects to look for in verification
-- `verify_require_all` - Require all these objects to be present
+When `verify_with_gdino` is true, hits are reranked by checking whether Florence-2 captions contain the `verify_prompts` terms. No extra detector inference is required at query time; the reranker reuses the captions stored at ingest time.
 
-### 3. Action Search (`mode: "action"`)
-Searches for specific actions or activities in video segments.
+### Action search
 
-**Example:**
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
@@ -218,15 +142,12 @@ curl -X POST http://127.0.0.1:8000/query \
     "video_url":"https://youtu.be/zPxQjuFoUBc",
     "mode":"action",
     "query":"chopping meat",
-    "filter_objects":"person",
     "k":40
   }'
 ```
 
-### 4. Action Chain Search (`mode: "action_chain"`)
-Finds sequences of related actions in order.
+### Action-chain search
 
-**Example:**
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
@@ -239,19 +160,12 @@ curl -X POST http://127.0.0.1:8000/query \
   }'
 ```
 
-**Parameters:**
-- `steps` - Ordered list of actions to find
-- `max_gap` - Maximum time gap between consecutive actions
+Parameters:
+- `steps` — ordered list of action prompts.
+- `max_gap` — maximum seconds between the end of one matched clip and the start of the next.
 
-## 🌐 Search Scopes
+### Global scope
 
-### Video Scope (`scope: "video"`)
-Search within a specific video.
-
-### Global Scope (`scope: "global"`)
-Search across all processed videos.
-
-**Example:**
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
@@ -263,72 +177,56 @@ curl -X POST http://127.0.0.1:8000/query \
   }'
 ```
 
-## 🧪 Testing the System
+## Auxiliary Endpoints
 
-### 1. Test Video Ingestion
-```bash
-# Ingest a short YouTube video
-curl -X POST "http://127.0.0.1:8000/ingest" \
-  -H "Content-Type: application/json" \
-  -d '{"video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET  | `/search`           | Legacy text search for a single video. |
+| GET  | `/vsearch`          | Legacy frame-level visual search. |
+| GET  | `/asearch`          | Legacy action-clip search for a single video. |
+| GET  | `/asearch_chain`    | Legacy action-chain search. |
+| GET  | `/asearch_all`      | Action search across all indexed videos. |
+| GET  | `/videos`           | List ingested videos and available indexes. |
+| POST | `/ingest`           | Run the ingestion pipeline for a video. |
+| POST | `/build_contexts`   | Rebuild per-video context vectors used by the global scope. |
+| POST | `/ov_verify`        | Run OWLv2 detection on specified frames for ad-hoc verification. |
 
-# Check if video was processed
-curl "http://127.0.0.1:8000/videos"
+Static file mounts:
+- `/frames/<video_id>/...` serves sampled frames.
+- `/media/<video_id>.mp4` serves source media.
+
+## Request Models
+
+The primary request body, `UnifiedSearchRequest`:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `video_url` | string | — | Required for scope `video` unless `video_id` given. |
+| `video_id` | string | — | Derived from URL when absent. |
+| `query` | string | — | Required for `text`, `visual`, `action`. |
+| `mode` | `text` \| `visual` \| `action` \| `action_chain` | — | |
+| `k` | int | 50 | Top-k after deduping and NMS. |
+| `filter_objects` | string | null | Keep hits whose object labels contain this string. |
+| `steps` | string[] | null | Required for `action_chain`. |
+| `max_gap` | float | 8.0 | Inter-step gap in seconds for `action_chain`. |
+| `ingest_if_needed` | bool | true | Auto-ingest when indexes are missing. |
+| `scope` | `video` \| `global` | `video` | |
+| `videos` | string[] | null | Restrict global scope to these video_ids. |
+| `verify_with_gdino` | bool | false | Enable caption-based verification rerank. |
+| `verify_prompts` | string[] | null | Terms sought in captions. |
+| `verify_require_all` | string[] | null | Hard-required terms for the rerank. |
+
+## Data Layout
+
+```
+backend/data/
+  media/      <video_id>.mp4, <video_id>.wav
+  frames/     <video_id>/frame-XXXXXX.jpg
+  indexes/    <video_id>.faiss         text
+              <video_id>.vfaiss        visual (caption embeddings)
+              <video_id>.aclip.faiss   action clips
+              meta.sqlite              rows, captions, object labels, context
+  transcripts/<video_id>.json
 ```
 
-### 2. Test Text Search
-```bash
-# Search for specific words or phrases
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"text",
-    "query":"never gonna",
-    "k":3
-  }'
-```
-
-### 3. Test Visual Search
-```bash
-# Search for visual content (requires visual ingestion)
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"visual",
-    "query":"person singing",
-    "k":5
-  }'
-```
-
-### 4. Test Action Search
-```bash
-# Search for actions (requires visual ingestion)
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"action",
-    "query":"dancing",
-    "k":10
-  }'
-```
-
-### 5. Test GroundingDINO Verification
-```bash
-# Use advanced object detection to verify results
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"visual",
-    "query":"person with microphone",
-    "verify_with_gdino": true,
-    "verify_prompts": ["person", "microphone"],
-    "verify_require_all": ["person"],
-    "k":5
-  }'
-```
-
-
+To reset the service, stop the server and remove everything under `backend/data/` except the directory itself.

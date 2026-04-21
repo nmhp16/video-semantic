@@ -37,16 +37,17 @@ def ingest(url_or_path: str):
         video_id = m.group(1)
     else:
         video_id = Path(url_or_path).stem # For local files
-    
-    # Download or copy
-    if url_or_path.startswith("http"):
-        tmp_media = os.path.join(MEDIA, f"{video_id}.mp4")
-        ytdlp(url_or_path, tmp_media)
-        audio = os.path.join(MEDIA, f"{video_id}.wav")
-        extract_audio(tmp_media, audio)
-    else:
-        audio = os.path.join(MEDIA, f"{video_id}.wav")
-        extract_audio(url_or_path, audio)
+
+    audio = os.path.join(MEDIA, f"{video_id}.wav")
+
+    if not os.path.exists(audio):
+        if url_or_path.startswith("http"):
+            tmp_media = os.path.join(MEDIA, f"{video_id}.mp4")
+            if not os.path.exists(tmp_media):
+                ytdlp(url_or_path, tmp_media)
+            extract_audio(tmp_media, audio)
+        else:
+            extract_audio(url_or_path, audio)
 
     # ASR
     segments = transcribe(audio)

@@ -11,6 +11,8 @@ opencv-python
 pillow
 torch
 torchvision
-transformers
+transformers>=4.41,<4.50
 spacy
 bertopic
+einops 
+timm

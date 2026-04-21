@@ -16,11 +16,24 @@ os.makedirs(FRAMES, exist_ok=True)
 
 YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
+def _has_video_stream(path: str) -> bool:
+    try:
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0", path
+        ]).decode().strip()
+        return out == "video"
+    except Exception:
+        return False
+
 def ytdlp_video(url: str, out_mp4: str):
-        subprocess.check_call([
-            "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
-            "-o", out_mp4, url
-        ])
+    if os.path.exists(out_mp4) and not _has_video_stream(out_mp4):
+        os.remove(out_mp4)
+    subprocess.check_call([
+        "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
+        "-o", out_mp4, url
+    ])
 
 # --- Frame sampling ---
 def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List[Dict]:
@@ -37,7 +50,10 @@ def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List
 
     # FFMPEG write frame-%06d.jpg starting at index 0
     subprocess.check_call([
-        "ffmpeg","-y","-i", video_path, "-vf", f"fps={fps}", os.path.join(out_dir, "frame-%06d.jpg")
+        "ffmpeg","-y","-i", video_path,
+        "-vf", f"fps={fps},scale=-2:720",
+        "-q:v", "3",
+        os.path.join(out_dir, "frame-%06d.jpg")
     ])
 
     # Collect files and compute timestamps by index * every_sec
@@ -53,36 +69,55 @@ def sample_frames(video_path: str, out_dir: str, every_sec: float = 1.0) -> List
 
     return out
 
-# --- Florence-2 captioning + object detection ---
+# --- Caption keyword extraction (replaces Florence-2 <OD> pass) ---
+_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_STOPWORDS = {
+    "the","and","with","that","this","from","into","onto","over","under","near","upon",
+    "very","some","many","much","more","most","less","just","also","their","there","here",
+    "which","while","when","where","what","about","above","below","then","than","they",
+    "them","these","those","have","has","had","are","was","were","been","being","its",
+    "his","her","him","she","you","your","our","ours","theirs","itself",
+    "appears","looking","visible","background","foreground","image","picture","photo",
+}
+
+def _caption_keywords(caption: str) -> List[str]:
+    if not caption:
+        return []
+    words = (w.lower() for w in _WORD_RE.findall(caption))
+    return sorted({w for w in words if w not in _STOPWORDS})
+
+# --- Florence-2 captioning ---
 class Florence2Captioner:
     def __init__(self, model_id: str = "microsoft/Florence-2-base"):
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif torch.backends.mps.is_available():
+            self._device = "mps"
+        else:
+            self._device = "cpu"
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id, trust_remote_code=True
         ).to(self._device).eval()
 
-    def _run_task(self, image: Image.Image, task: str) -> dict:
+    def _run_task(self, image: Image.Image, task: str, max_new_tokens: int = 128) -> dict:
         inputs = self.processor(text=task, images=image, return_tensors="pt").to(self._device)
         with torch.no_grad():
             gen = self.model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                max_new_tokens=256,
-                num_beams=3,
+                max_new_tokens=max_new_tokens,
+                num_beams=1,
+                do_sample=False,
             )
         text = self.processor.batch_decode(gen, skip_special_tokens=False)[0]
         return self.processor.post_process_generation(text, task=task, image_size=image.size)
 
     def process_image(self, image: Image.Image) -> Dict:
-        """Return a detailed caption and object labels for one image."""
-        cap_result = self._run_task(image, "<MORE_DETAILED_CAPTION>")
+        """Return a detailed caption and caption-derived object keywords."""
+        cap_result = self._run_task(image, "<MORE_DETAILED_CAPTION>", max_new_tokens=128)
         caption = cap_result.get("<MORE_DETAILED_CAPTION>", "")
-
-        od_result = self._run_task(image, "<OD>")
-        od_data = od_result.get("<OD>", {})
-        objects = sorted(set(od_data.get("labels", []))) if isinstance(od_data, dict) else []
-
+        objects = _caption_keywords(caption)
         return {"caption": caption, "objects": objects}
 
     def process_images(self, pil_images: List[Image.Image]) -> List[Dict]:
