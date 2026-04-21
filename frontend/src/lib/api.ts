@@ -14,12 +14,13 @@ export interface UnifiedSearchHit {
   text?: string
   frame?: string
   objects?: string[]
+  caption?: string
   video_id: string
 }
 
 export interface UnifiedSearchResponse {
   video_id: string | null
-  mode: 'text' | 'visual' | 'action' | 'action_chain'
+  mode: 'text' | 'visual' | 'action'
   hits: UnifiedSearchHit[]
   info: Record<string, unknown>
 }
@@ -31,7 +32,7 @@ export interface IngestResponse {
   status: 'completed' | 'already_exists'
 }
 
-export type SearchMode = 'text' | 'visual' | 'action' | 'action_chain'
+export type SearchMode = 'text' | 'visual' | 'action'
 export type SearchScope = 'video' | 'global'
 
 export interface UnifiedSearchRequest {
@@ -40,9 +41,6 @@ export interface UnifiedSearchRequest {
   query?: string
   mode: SearchMode
   k?: number
-  filter_objects?: string
-  steps?: string[]
-  max_gap?: number
   ingest_if_needed?: boolean
   scope?: SearchScope
   videos?: string[]
@@ -88,7 +86,4 @@ export const api = {
     return `${BASE_URL}/frames/${rel}`
   },
 
-  mediaUrl(videoId: string): string {
-    return `${BASE_URL}/media/${videoId}.mp4`
-  },
 }

@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronUp, Globe, Video } from 'lucide-react'
-import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import type { VideoMeta, SearchScope } from '@/lib/api'
 
@@ -10,8 +9,6 @@ interface FilterPanelProps {
   onVideoChange: (id: string) => void
   scope: SearchScope
   onScopeChange: (scope: SearchScope) => void
-  filterObjects: string
-  onFilterObjectsChange: (val: string) => void
 }
 
 export function FilterPanel({
@@ -20,8 +17,6 @@ export function FilterPanel({
   onVideoChange,
   scope,
   onScopeChange,
-  filterObjects,
-  onFilterObjectsChange,
 }: FilterPanelProps) {
   const [open, setOpen] = useState(false)
 
@@ -31,7 +26,9 @@ export function FilterPanel({
         onClick={() => setOpen(!open)}
         className="flex w-full items-center justify-between px-4 py-2.5 text-sm text-vs-muted hover:text-vs-text transition-colors"
       >
-        <span className="font-medium">Filters</span>
+        <span className="font-medium">
+          {scope === 'global' ? 'All videos' : selectedVideo ? `Video: ${selectedVideo}` : 'Select video'}
+        </span>
         {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
       </button>
 
@@ -39,20 +36,8 @@ export function FilterPanel({
         <div className="border-t border-white/7 px-4 py-4 space-y-4 animate-fade-in">
           {/* Scope */}
           <div>
-            <label className="block text-xs font-medium text-vs-muted mb-2">Scope</label>
+            <label className="block text-xs font-medium text-vs-muted mb-2">Search across</label>
             <div className="flex gap-2">
-              <button
-                onClick={() => onScopeChange('video')}
-                className={cn(
-                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all',
-                  scope === 'video'
-                    ? 'bg-vs-accent/15 text-vs-accent-light border-vs-accent/30'
-                    : 'border-white/8 text-vs-muted hover:bg-white/5'
-                )}
-              >
-                <Video className="h-3 w-3" />
-                Single Video
-              </button>
               <button
                 onClick={() => onScopeChange('global')}
                 className={cn(
@@ -65,13 +50,25 @@ export function FilterPanel({
                 <Globe className="h-3 w-3" />
                 All Videos
               </button>
+              <button
+                onClick={() => onScopeChange('video')}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all',
+                  scope === 'video'
+                    ? 'bg-vs-accent/15 text-vs-accent-light border-vs-accent/30'
+                    : 'border-white/8 text-vs-muted hover:bg-white/5'
+                )}
+              >
+                <Video className="h-3 w-3" />
+                Single Video
+              </button>
             </div>
           </div>
 
           {/* Video select */}
           {scope === 'video' && (
             <div>
-              <label className="block text-xs font-medium text-vs-muted mb-2">Video</label>
+              <label className="block text-xs font-medium text-vs-muted mb-2">Choose video</label>
               {videos.length === 0 ? (
                 <p className="text-xs text-vs-subtle italic">No videos ingested yet</p>
               ) : (
@@ -99,17 +96,6 @@ export function FilterPanel({
               )}
             </div>
           )}
-
-          {/* Object filter */}
-          <div>
-            <label className="block text-xs font-medium text-vs-muted mb-2">Filter by object</label>
-            <Input
-              placeholder="e.g. person, car, laptop"
-              value={filterObjects}
-              onChange={(e) => onFilterObjectsChange(e.target.value)}
-              className="h-8 text-xs"
-            />
-          </div>
         </div>
       )}
     </div>
