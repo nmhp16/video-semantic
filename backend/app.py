@@ -288,13 +288,38 @@ def search_text_single(video_id: str, q: str, k: int):
     return out
 
 def _apply_filter_objects(objs: List[str], filter_objects: Optional[str]) -> bool:
-    """Return True if this hit should be kept. If objects list is empty (no
-    captions generated yet), the filter is a no-op rather than rejecting the hit."""
+    """Word-list filter used inside SigLIP search (before captioning).
+    No-op when filter_objects is empty or objs is empty; otherwise requires a
+    case-insensitive exact word match. Kept for legacy /vsearch /asearch paths."""
     if not filter_objects:
         return True
     if not objs:
         return True
-    return filter_objects in objs
+    needle = filter_objects.strip().lower()
+    if not needle:
+        return True
+    return any(needle == str(o).strip().lower() for o in objs)
+
+def _hit_matches_filter(hit: dict, filter_objects: Optional[str]) -> bool:
+    """Post-caption filter for /query: case-insensitive substring match against
+    the caption *and* the object keyword list. Graceful no-op if the hit has
+    neither caption nor objects populated yet. This is what actually runs after
+    lazy Florence-2 captioning, so it catches 'knives' in captions that say
+    'using a knife to cut', 'Knife' typed with a capital, etc."""
+    if not filter_objects:
+        return True
+    needle = filter_objects.strip().lower()
+    if not needle:
+        return True
+    caption = (hit.get("caption") or "").lower()
+    objs = hit.get("objects") or []
+    if caption and needle in caption:
+        return True
+    if any(needle in str(o).strip().lower() for o in objs):
+        return True
+    if not caption and not objs:
+        return True  # nothing to filter against yet
+    return False
 
 def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str]):
     """Visual frame search backed by SigLIP vision-text embeddings."""
@@ -706,7 +731,7 @@ def unified_query(body: UnifiedSearchRequest):
             _caption_hits_lazy(vid, raw)
             # Post-caption filter_objects (now that object words are available)
             if body.filter_objects:
-                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -727,7 +752,7 @@ def unified_query(body: UnifiedSearchRequest):
                     h["frame"] = representative_frame_for_segment(vid, h["start"], h["end"])
             _caption_hits_lazy(vid, raw)
             if body.filter_objects:
-                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -786,7 +811,7 @@ def unified_query(body: UnifiedSearchRequest):
             )
             _caption_hits_lazy(None, raw)
             if body.filter_objects:
-                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
@@ -810,7 +835,7 @@ def unified_query(body: UnifiedSearchRequest):
                     h["frame"] = representative_frame_for_segment(h["video_id"], h["start"], h["end"])
             _caption_hits_lazy(None, raw)
             if body.filter_objects:
-                raw = [h for h in raw if _apply_filter_objects(h.get("objects") or [], body.filter_objects)]
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw = _maybe_caption_rerank(
                 raw,
                 verify_on=body.verify_with_gdino,
