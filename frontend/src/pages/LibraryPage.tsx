@@ -10,6 +10,7 @@ import type { VideoMeta } from '@/lib/api'
 export function LibraryPage() {
   const [videos, setVideos] = useState<VideoMeta[]>([])
   const [loading, setLoading] = useState(true)
+  const [libraryError, setLibraryError] = useState<string | null>(null)
   const [ingestOpen, setIngestOpen] = useState(false)
   const navigate = useNavigate()
 
@@ -18,8 +19,9 @@ export function LibraryPage() {
     try {
       const res = await api.getVideos()
       setVideos(res.videos)
-    } catch {
-      /* backend may not be running */
+      setLibraryError(null)
+    } catch (e) {
+      setLibraryError(e instanceof Error ? e.message : 'Could not reach backend')
     } finally {
       setLoading(false)
     }
@@ -50,10 +52,18 @@ export function LibraryPage() {
         </div>
       </div>
 
+      {libraryError && (
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2.5">
+          <p className="text-sm font-medium text-red-400">Backend unreachable</p>
+          <p className="mt-0.5 text-xs text-muted break-all">{libraryError}</p>
+        </div>
+      )}
+
       <VideoLibrary
         videos={videos}
         loading={loading}
         onSelect={(id) => navigate(`/?video=${encodeURIComponent(id)}`)}
+        onDeleted={() => fetchVideos()}
       />
 
       <IngestModal

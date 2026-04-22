@@ -1,32 +1,54 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import numpy as np, json, os
+import numpy as np, json, os, re, logging
+from urllib.parse import urlparse, parse_qs
 from sentence_transformers import SentenceTransformer
 from typing import List, Optional, Dict, Any
 from store import (
-    load_index, get_conn,
+    load_index, db,
     load_siglip_visual_index, load_siglip_action_clips_index,
     get_cached_captions, put_cached_captions,
-    filter_videos_by_context, passes_hard_context, build_video_context,
+    filter_videos_by_context, build_video_context,
+    clear_video,
 )
 from models import (
     SearchResponse, SearchHit, VideoIngestRequest, OVVerifyRequest,
     UnifiedSearchRequest, UnifiedSearchHit, UnifiedSearchResponse,
+    MAX_K,
 )
 from utils_unified import extract_video_id
 from gdino import detect_on_image
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
+
+# CORS: comma-separated origins in CORS_ORIGINS, falling back to common
+# local-dev ports. Wildcard is incompatible with allow_credentials, so we
+# only enable credentials when an explicit allowlist is configured.
+_cors_raw = os.environ.get("CORS_ORIGINS", "").strip()
+if _cors_raw:
+    _cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+else:
+    _cors_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+    ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-_data_dir = os.path.join(os.path.dirname(__file__), "data")
+_BASE_DIR = os.path.dirname(__file__)
+_data_dir = os.path.join(_BASE_DIR, "data")
 _frames_dir = os.path.join(_data_dir, "frames")
 _media_dir = os.path.join(_data_dir, "media")
+_indexes_dir = os.path.join(_data_dir, "indexes")
 os.makedirs(_frames_dir, exist_ok=True)
 os.makedirs(_media_dir, exist_ok=True)
 app.mount("/frames", StaticFiles(directory=_frames_dir), name="frames")
@@ -78,15 +100,15 @@ def _caption_hits_lazy(video_id: Optional[str], hits: list[dict]) -> None:
         if missing:
             if captioner is None:
                 captioner = _get_captioner()
+            from PIL import Image as _PilImage
             for h in missing:
                 frame = h["frame"]
-                abs_path = os.path.join(os.path.dirname(_data_dir), frame) if not os.path.isabs(frame) else frame
+                abs_path = frame if os.path.isabs(frame) else os.path.join(_BASE_DIR, frame)
                 try:
-                    from PIL import Image as _PilImage
                     img = _PilImage.open(abs_path).convert("RGB")
                     result = captioner.process_image(img)
-                except Exception as e:
-                    print(f"[lazy caption] failed for {frame}: {e}")
+                except Exception:
+                    logger.exception("lazy caption failed for %s", frame)
                     result = {"caption": "", "objects": []}
                 new_entries[frame] = result
             put_cached_captions(vid, new_entries)
@@ -146,34 +168,31 @@ def nms_time(hits, tol=0.5):
 
 
 def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False) -> bool:
-    idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
     ok = True
     if need_text:
-        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.faiss"))
+        ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.faiss"))
     if need_visual:
-        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.svfaiss"))
+        ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.svfaiss"))
     if need_action:
-        ok &= os.path.exists(os.path.join(idx_dir, f"{video_id}.saclip.faiss"))
+        ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.saclip.faiss"))
     return ok
 
 def ensure_ingested(video_url: str, video_id: str, need_text: bool, need_visual: bool, need_action: bool):
     from ingest import ingest as do_ingest
     from visual_ingest import ingest_visual as do_visual_ingest
     need_visual_or_action = need_visual or need_action
-    idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
-    if need_text and not os.path.exists(os.path.join(idx_dir, f"{video_id}.faiss")):
+    if need_text and not os.path.exists(os.path.join(_indexes_dir, f"{video_id}.faiss")):
         do_ingest(video_url)
-    if need_visual_or_action and not os.path.exists(os.path.join(idx_dir, f"{video_id}.svfaiss")):
+    if need_visual_or_action and not os.path.exists(os.path.join(_indexes_dir, f"{video_id}.svfaiss")):
         do_visual_ingest(video_url)
 
-def expand_prompt(prompt: str) -> list[str]:
-    return [prompt]
-
-def encode_prompt_set(model, prompts: list[str]) -> np.ndarray:
-    X = model.encode(prompts, normalize_embeddings=True).astype('float32')
-    v = X.mean(axis=0)
-    v /= (np.linalg.norm(v) + 1e-12)
-    return v.reshape(1, -1)
+def _parse_objects(raw: Optional[str]) -> list:
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 def search_action_clips(video_id: str, q: str, k: int, filter_objects: str | None):
     """Legacy-named action search; now backed by the SigLIP action-clip index."""
@@ -185,7 +204,7 @@ def search_action_clips(video_id: str, q: str, k: int, filter_objects: str | Non
         if idx == -1:
             continue
         _, start, end, objects_json, caption = rows[idx]
-        objs = json.loads(objects_json) if objects_json else []
+        objs = _parse_objects(objects_json)
         if filter_objects and objs and (filter_objects not in objs):
             continue
         hits.append({
@@ -224,36 +243,31 @@ def chain_actions(video_id: str, steps: list[str], k_per_step=40, max_gap=8.0, f
 
 def representative_frame_for_segment(video_id: str, seg_start: float, seg_end: float) -> Optional[str]:
     mid = 0.5 * (float(seg_start) + float(seg_end))
-    conn = get_conn()
-
-    # Exact containment of midpoint
-    row = conn.execute("""
-        SELECT frame, start, end
-        FROM visual_chunks
-        WHERE video_id=? AND start <= ? AND end >= ?
-        ORDER BY ABS((start+end)/2.0 - ?) ASC
-        LIMIT 1
-    """, (video_id, mid, mid, mid)).fetchone()
-
-    if not row:
-        # Any overlap, closest to midpoint
+    with db() as conn:
+        # Exact containment of midpoint
         row = conn.execute("""
             SELECT frame, start, end
             FROM visual_chunks
-            WHERE video_id=? AND end >= ? AND start <= ?
-            ORDER BY 
-              CASE 
-                WHEN ? BETWEEN start AND end THEN 0 
-                ELSE MIN(ABS(start-?), ABS(end-?)) 
-              END ASC
+            WHERE video_id=? AND start <= ? AND end >= ?
+            ORDER BY ABS((start+end)/2.0 - ?) ASC
             LIMIT 1
-        """, (video_id, seg_start, seg_end, mid, mid, mid)).fetchone()
-    
-    conn.close()
-    if row:
-        return row[0]
-    else:
-        return None
+        """, (video_id, mid, mid, mid)).fetchone()
+
+        if not row:
+            # Any overlap, closest to midpoint
+            row = conn.execute("""
+                SELECT frame, start, end
+                FROM visual_chunks
+                WHERE video_id=? AND end >= ? AND start <= ?
+                ORDER BY
+                  CASE
+                    WHEN ? BETWEEN start AND end THEN 0
+                    ELSE MIN(ABS(start-?), ABS(end-?))
+                  END ASC
+                LIMIT 1
+            """, (video_id, seg_start, seg_end, mid, mid, mid)).fetchone()
+
+    return row[0] if row else None
     
 def action_frame_resolver(hit: Dict[str, Any]) -> Optional[str]:
     if hit.get("frame"):
@@ -263,11 +277,10 @@ def action_frame_resolver(hit: Dict[str, Any]) -> Optional[str]:
 # per-video + global helpers
 # --------------------
 def list_video_ids_with(ext: str) -> list[str]:
-    idx_dir = os.path.join(os.path.dirname(__file__), "data", "indexes")
-    if not os.path.isdir(idx_dir):
+    if not os.path.isdir(_indexes_dir):
         return []
     vids = []
-    for fn in os.listdir(idx_dir):
+    for fn in os.listdir(_indexes_dir):
         if fn.endswith(ext):
             vids.append(fn[:-len(ext)])
     return vids
@@ -327,12 +340,11 @@ def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional
     qv = _get_siglip().encode_text([q])
     D, I = index.search(qv, k)
     out = []
-    import json as _json
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
         if idx == -1:
             continue
         _, start, end, frame, objects, caption = rows[idx]
-        objs = _json.loads(objects) if objects else []
+        objs = _parse_objects(objects)
         if not _apply_filter_objects(objs, filter_objects):
             continue
         out.append({
@@ -345,7 +357,6 @@ def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional
 
 def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional[str]):
     """Action-clip search backed by SigLIP vision-text embeddings."""
-    import json as _json
     index, rows = load_siglip_action_clips_index(video_id)
     qv = _get_siglip().encode_text([q])
     D, I = index.search(qv, k)
@@ -354,7 +365,7 @@ def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional
         if idx == -1:
             continue
         _, start, end, objects_json, caption = rows[idx]
-        objs = _json.loads(objects_json) if objects_json else []
+        objs = _parse_objects(objects_json)
         if not _apply_filter_objects(objs, filter_objects):
             continue
         out.append({
@@ -379,8 +390,8 @@ def search_text_global(q: str, k: int, restrict_videos: Optional[list[str]] = No
     for vid in vids:
         try:
             all_hits.extend(search_text_single(vid, q, k))
-        except Exception as e:
-            print(f"[text global] skip {vid}: {e}")
+        except Exception:
+            logger.warning("text global search skipped %s", vid, exc_info=True)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     return all_hits
 
@@ -395,8 +406,8 @@ def search_visual_global(q: str, k: int, filter_objects: Optional[str] = None,
     for vid in vids:
         try:
             all_hits.extend(search_visual_single(vid, q, k, filter_objects))
-        except Exception as e:
-            print(f"[visual global] skip {vid}: {e}")
+        except Exception:
+            logger.warning("visual global search skipped %s", vid, exc_info=True)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     return all_hits
 
@@ -411,8 +422,8 @@ def search_action_global(q: str, k: int, filter_objects: Optional[str] = None,
     for vid in vids:
         try:
             all_hits.extend(search_action_single(vid, q, k, filter_objects))
-        except Exception as e:
-            print(f"[action global] skip {vid}: {e}")
+        except Exception:
+            logger.warning("action global search skipped %s", vid, exc_info=True)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     return all_hits
 
@@ -472,7 +483,11 @@ def _as_unified(h: dict) -> UnifiedSearchHit:
 # Endpoints
 # --------------------
 @app.get("/search", response_model=SearchResponse)
-async def search(video_id: str = Query(...), q: str = Query(...), k: int = 5):
+async def search(
+    video_id: str = Query(...),
+    q: str = Query(...),
+    k: int = Query(5, ge=1, le=MAX_K),
+):
     index, rows = load_index(video_id)
     qv = EMB.encode([q], normalize_embeddings=True).astype('float32')
     D, I = index.search(qv, k)
@@ -485,7 +500,12 @@ async def search(video_id: str = Query(...), q: str = Query(...), k: int = 5):
     return SearchResponse(video_id=video_id, hits=hits)
 
 @app.get("/vsearch")
-async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, filter_objects: str | None = None):
+async def vsearch(
+    video_id: str = Query(...),
+    q: str = Query(...),
+    k: int = Query(6, ge=1, le=MAX_K),
+    filter_objects: str | None = None,
+):
     """Legacy visual search; now backed by the SigLIP frame index."""
     try:
         hits = search_visual_single(video_id, q, k, filter_objects)
@@ -502,7 +522,7 @@ async def vsearch(video_id: str = Query(...), q: str = Query(...), k: int = 6, f
 async def asearch(
     video_id: str = Query(...),
     q: str = Query(...),
-    k: int = 40,
+    k: int = Query(40, ge=1, le=MAX_K),
     filter_objects: str | None = None
 ):
     try:
@@ -523,8 +543,8 @@ async def asearch(
 async def asearch_chain(
     video_id: str = Query(...),
     steps: List[str] = Query(..., description="Ordered list of action prompts"),
-    k_per_step: int = 40,
-    max_gap: float = 8.0,
+    k_per_step: int = Query(40, ge=1, le=MAX_K),
+    max_gap: float = Query(8.0, ge=0.0, le=60.0),
     filter_objects: str | None = None
 ):
     try:
@@ -547,44 +567,63 @@ async def asearch_chain(
         "candidates_preview": [c[:5] for c in cand]
     }
 
-def fetch_clip_row(video_id: str, clip_idx: int):
-    conn = get_conn()
-    row = conn.execute("""
-        SELECT idx, start, end, objects
-        FROM visual_clips
-        WHERE video_id=? AND idx=?
-    """, (video_id, clip_idx)).fetchone()
-    conn.close()
-    return row
+def _thumbnail_url_for(video_id: str) -> Optional[str]:
+    """Return the mounted URL of the first sampled frame, or None if missing."""
+    frames_subdir = os.path.join(_frames_dir, video_id)
+    if not os.path.isdir(frames_subdir):
+        return None
+    try:
+        jpgs = sorted(
+            f for f in os.listdir(frames_subdir)
+            if f.startswith("frame-") and f.endswith(".jpg")
+        )
+    except OSError:
+        return None
+    if not jpgs:
+        return None
+    return f"/frames/{video_id}/{jpgs[0]}"
 
 @app.get("/videos")
 async def list_videos():
     try:
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
-        media_dir = os.path.join(data_dir, "media")
-        if not os.path.exists(media_dir):
+        if not os.path.exists(_media_dir):
             return {"videos": []}
         videos = []
-        for filename in os.listdir(media_dir):
+        for filename in os.listdir(_media_dir):
             if filename.endswith('.mp4'):
                 vid = filename[:-4]
-                indexes_dir = os.path.join(data_dir, "indexes")
-                has_text = os.path.exists(os.path.join(indexes_dir, f"{vid}.faiss"))
-                has_visual = os.path.exists(os.path.join(indexes_dir, f"{vid}.svfaiss"))
-                has_actions = os.path.exists(os.path.join(indexes_dir, f"{vid}.saclip.faiss"))
+                has_text = os.path.exists(os.path.join(_indexes_dir, f"{vid}.faiss"))
+                has_visual = os.path.exists(os.path.join(_indexes_dir, f"{vid}.svfaiss"))
+                has_actions = os.path.exists(os.path.join(_indexes_dir, f"{vid}.saclip.faiss"))
                 videos.append({
                     "video_id": vid,
                     "has_text_search": has_text,
                     "has_visual_search": has_visual,
-                    "has_action_search": has_actions
+                    "has_action_search": has_actions,
+                    "thumbnail_url": _thumbnail_url_for(vid),
                 })
         return {"videos": sorted(videos, key=lambda x: x['video_id'])}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing videos: {e}")
 
+# Video IDs must be alphanumeric + [_-] to stop path traversal / injection when
+# they're spliced into filenames and FAISS paths.
+_VIDEO_ID_RE = r"^[A-Za-z0-9_-]{1,64}$"
+
+@app.delete("/videos/{video_id}")
+def delete_video(video_id: str = Path(..., pattern=_VIDEO_ID_RE)):
+    """Remove every trace of a video: DB rows, FAISS indexes, media, frames."""
+    try:
+        clear_video(video_id)
+    except Exception as e:
+        logger.exception("delete_video failed for %s", video_id)
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+    return {"success": True, "video_id": video_id}
+
 @app.get("/asearch_all")
 def asearch_all(
-    q: str = Query(...), k: int = 50,
+    q: str = Query(...),
+    k: int = Query(50, ge=1, le=MAX_K),
     filter_objects: str | None = None,
     videos: list[str] | None = Query(None, description="Optional list of video_ids to restrict to")
 ):
@@ -592,14 +631,12 @@ def asearch_all(
         hits = search_action_global(q, k, filter_objects=filter_objects, restrict_videos=videos)
         return {"query": q, "hits": hits[:k]}
     except Exception as e:
-        print(f"Error in /asearch_all: {e}")
+        logger.exception("/asearch_all failed")
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
 @app.post("/ingest")
 async def ingest_video(request: VideoIngestRequest):
     try:
-        import re
-        from urllib.parse import urlparse, parse_qs
         video_url = request.video_url
 
         if request.video_id:
@@ -616,10 +653,9 @@ async def ingest_video(request: VideoIngestRequest):
             else:
                 video_id = re.sub(r'[^a-zA-Z0-9_-]', '', video_url.split('/')[-1])[:11]
 
-        print(f"Ingesting video: {video_id} from {video_url}")
+        logger.info("Ingesting video %s from %s", video_id, video_url)
 
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
-        media_path = os.path.join(data_dir, "media", f"{video_id}.mp4")
+        media_path = os.path.join(_media_dir, f"{video_id}.mp4")
         if os.path.exists(media_path):
             return {"success": True, "message": f"Video {video_id} already exists",
                     "video_id": video_id, "status": "already_exists"}
@@ -629,7 +665,7 @@ async def ingest_video(request: VideoIngestRequest):
 
         do_visual_ingest(video_url) # visual first: downloads full video, extracts wav
         do_ingest(video_url)        # text: reuses wav produced by visual ingest
-        
+
         # Build video context for better search filtering
         build_video_context(video_id)
 
@@ -637,7 +673,7 @@ async def ingest_video(request: VideoIngestRequest):
                 "video_id": video_id, "status": "completed"}
 
     except Exception as e:
-        print(f"Ingestion error: {e}")
+        logger.exception("Ingestion error")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/build_contexts")
@@ -646,26 +682,25 @@ async def rebuild_video_contexts(video_ids: Optional[List[str]] = None):
     try:
         if video_ids is None:
             # Build contexts for all videos that have any index
-            from store import get_conn
-            conn = get_conn()
-            rows = conn.execute("""
-                SELECT DISTINCT video_id FROM chunks
-                UNION
-                SELECT DISTINCT video_id FROM visual_chunks
-                UNION  
-                SELECT DISTINCT video_id FROM visual_clips
-            """).fetchall()
-            conn.close()
+            with db() as conn:
+                rows = conn.execute("""
+                    SELECT DISTINCT video_id FROM chunks
+                    UNION
+                    SELECT DISTINCT video_id FROM visual_chunks
+                    UNION
+                    SELECT DISTINCT video_id FROM visual_clips
+                """).fetchall()
             video_ids = [row[0] for row in rows]
-        
+
         results = []
         for video_id in video_ids:
             try:
                 build_video_context(video_id)
                 results.append({"video_id": video_id, "status": "success"})
             except Exception as e:
+                logger.exception("build_video_context failed for %s", video_id)
                 results.append({"video_id": video_id, "status": "error", "error": str(e)})
-        
+
         success_count = sum(1 for r in results if r["status"] == "success")
         return {
             "success": True,

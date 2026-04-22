@@ -21,16 +21,21 @@ class VideoIngestRequest(BaseModel):
     video_id: Optional[str] = None  # If not provided, will be extracted from URL
 
 MODE = Literal["text", "visual", "action", "action_chain"]
+
+# Keep search fan-out bounded so a single client can't request thousands
+# of hits (every hit may trigger lazy Florence-2 captioning).
+MAX_K = 200
+
 class UnifiedSearchRequest(BaseModel):
     video_url: Optional[str] = None
     video_id: Optional[str] = None
     query: Optional[str] = None
     mode: MODE
-    k: int = 50
+    k: int = Field(default=50, ge=1, le=MAX_K)
     filter_objects: Optional[str] = None
     # Action chain params
     steps: Optional[List[str]] = None
-    max_gap: float = 8.0
+    max_gap: float = Field(default=8.0, ge=0.0, le=60.0)
     ingest_if_needed: bool = True
     scope: str = "video"
     videos: Optional[List[str]] = None
@@ -39,7 +44,7 @@ class UnifiedSearchRequest(BaseModel):
     verify_require_all: Optional[List[str]] = None
     verify_box_threshold: float = 0.3
     verify_text_threshold: float = 0.35
-    verify_topk: int = 30
+    verify_topk: int = Field(default=30, ge=1, le=MAX_K)
 
 class UnifiedSearchHit(BaseModel):
     start: float

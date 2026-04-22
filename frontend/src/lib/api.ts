@@ -5,6 +5,7 @@ export interface VideoMeta {
   has_text_search: boolean
   has_visual_search: boolean
   has_action_search: boolean
+  thumbnail_url?: string | null
 }
 
 export interface UnifiedSearchHit {
@@ -79,6 +80,14 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
     })
+  },
+
+  deleteVideo(videoId: string): Promise<{ success: boolean; video_id: string }> {
+    return request(`/videos/${encodeURIComponent(videoId)}`, { method: 'DELETE' })
+  },
+
+  assetUrl(path: string): string {
+    return path.startsWith('http') ? path : `${BASE_URL}${path}`
   },
 
   frameUrl(framePath: string): string {

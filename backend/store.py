@@ -1,4 +1,5 @@
-import os, sqlite3, faiss, numpy as np, json
+import os, shutil, sqlite3, faiss, numpy as np, json, logging
+from contextlib import contextmanager
 from typing import Optional, List, Tuple, Dict
 from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer
@@ -6,6 +7,8 @@ from bertopic import BERTopic
 import spacy
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
+
+logger = logging.getLogger(__name__)
 
 _nlp = None
 def _get_nlp():
@@ -120,23 +123,47 @@ def get_conn():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_video_context_topics ON video_context (video_id)")
     return conn
 
-def clear_video(video_id: str):
+@contextmanager
+def db():
+    """Context-managed sqlite connection. Always closes, even on exception."""
     conn = get_conn()
-    conn.execute("DELETE FROM chunks WHERE video_id=?", (video_id,))
-    conn.execute("DELETE FROM visual_chunks WHERE video_id=?", (video_id,))
-    conn.execute("DELETE FROM visual_clips  WHERE video_id=?", (video_id,))
-    conn.execute("DELETE FROM video_context WHERE video_id=?", (video_id,))
-    conn.execute("DELETE FROM caption_cache WHERE video_id=?", (video_id,))
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-    # Remove index files
-    for p in (INDEX_PATH(video_id), ACLIP_PATH(video_id), VINDEX_PATH(video_id),
-              META_PATH(video_id), SVINDEX_PATH(video_id), SACLIP_PATH(video_id)):
+def clear_video(video_id: str):
+    """Remove every trace of `video_id`: DB rows, FAISS indexes, media file,
+    extracted audio, and sampled frames directory."""
+    with db() as conn:
+        conn.execute("DELETE FROM chunks WHERE video_id=?", (video_id,))
+        conn.execute("DELETE FROM visual_chunks WHERE video_id=?", (video_id,))
+        conn.execute("DELETE FROM visual_clips  WHERE video_id=?", (video_id,))
+        conn.execute("DELETE FROM video_context WHERE video_id=?", (video_id,))
+        conn.execute("DELETE FROM caption_cache WHERE video_id=?", (video_id,))
+        conn.commit()
+
+    media_dir = os.path.join(DATA, "media")
+    frames_dir = os.path.join(DATA, "frames", video_id)
+    files_to_remove = [
+        INDEX_PATH(video_id), ACLIP_PATH(video_id), VINDEX_PATH(video_id),
+        META_PATH(video_id), SVINDEX_PATH(video_id), SACLIP_PATH(video_id),
+        os.path.join(media_dir, f"{video_id}.mp4"),
+        os.path.join(media_dir, f"{video_id}.wav"),
+    ]
+    for p in files_to_remove:
         try:
             os.remove(p)
         except FileNotFoundError:
             pass
+        except OSError:
+            logger.warning("Failed to remove %s", p, exc_info=True)
+
+    if os.path.isdir(frames_dir):
+        try:
+            shutil.rmtree(frames_dir)
+        except OSError:
+            logger.warning("Failed to remove frames dir %s", frames_dir, exc_info=True)
 
 # --- TEXT (ASR) INDEX ---
 def save_index(video_id: str, embeddings: np.ndarray, chunks: list[dict]):
@@ -150,26 +177,24 @@ def save_index(video_id: str, embeddings: np.ndarray, chunks: list[dict]):
     # Meta json
     with open(META_PATH(video_id), "w") as f:
         json.dump({"video_id": video_id, "n": len(chunks)}, f)
-    
+
     # SQLite rows
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO chunks(video_id, idx, start, end, text) VALUES(?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["text"]) for i, c in enumerate(chunks)]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO chunks(video_id, idx, start, end, text) VALUES(?, ?, ?, ?, ?)",
+            [(video_id, i, c["start"], c["end"], c["text"]) for i, c in enumerate(chunks)]
+        )
+        conn.commit()
 
 def load_index(video_id: str):
     index = faiss.read_index(INDEX_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, text 
-        FROM chunks 
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT idx, start, end, text
+            FROM chunks
+            WHERE video_id=?
+            ORDER BY idx
+        """, (video_id,)).fetchall()
     return index, rows
 
 # --- VISUAL INDEX ---
@@ -182,26 +207,24 @@ def save_visual_index(video_id: str, embeddings: np.ndarray, chunks: list[dict])
     faiss.write_index(index, VINDEX_PATH(video_id))
 
     # SQLite rows
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["frame"],
-          json.dumps(c.get("objects", [])), c.get("caption", ""))
-         for i, c in enumerate(chunks)]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            [(video_id, i, c["start"], c["end"], c["frame"],
+              json.dumps(c.get("objects", [])), c.get("caption", ""))
+             for i, c in enumerate(chunks)]
+        )
+        conn.commit()
 
 def load_visual_index(video_id: str):
     index = faiss.read_index(VINDEX_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, frame, objects, caption
-        FROM visual_chunks
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT idx, start, end, frame, objects, caption
+            FROM visual_chunks
+            WHERE video_id=?
+            ORDER BY idx
+        """, (video_id,)).fetchall()
     return index, rows
 
 # --- ACTION CLIP INDEX ---
@@ -218,26 +241,24 @@ def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list[di
     index.add(vecs.astype('float32'))
     faiss.write_index(index, ACLIP_PATH(video_id))
 
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
-        [(video_id, i, r["start"], r["end"],
-          json.dumps(r.get("objects", [])), r.get("caption", ""))
-         for i, r in enumerate(rows)]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
+            [(video_id, i, r["start"], r["end"],
+              json.dumps(r.get("objects", [])), r.get("caption", ""))
+             for i, r in enumerate(rows)]
+        )
+        conn.commit()
 
 def load_action_clips_index(video_id: str):
     index = faiss.read_index(ACLIP_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, objects, caption
-        FROM visual_clips
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT idx, start, end, objects, caption
+            FROM visual_clips
+            WHERE video_id=?
+            ORDER BY idx
+        """, (video_id,)).fetchall()
     return index, rows
 
 # --- SigLIP visual/action indexes (vision-text contrastive space) ---
@@ -253,6 +274,7 @@ def _save_ip_index(path: str, embeddings: np.ndarray):
             if existing.d != d:
                 os.remove(path)
         except Exception:
+            logger.warning("Removing corrupted FAISS index at %s", path, exc_info=True)
             os.remove(path)
     index = faiss.IndexFlatIP(d)
     vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
@@ -264,14 +286,13 @@ def save_siglip_visual_index(video_id: str, embeddings: np.ndarray):
 
 def load_siglip_visual_index(video_id: str):
     index = faiss.read_index(SVINDEX_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, frame, objects, caption
-        FROM visual_chunks
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT idx, start, end, frame, objects, caption
+            FROM visual_chunks
+            WHERE video_id=?
+            ORDER BY idx
+        """, (video_id,)).fetchall()
     return index, rows
 
 def save_siglip_action_clips_index(video_id: str, embeddings: np.ndarray):
@@ -279,60 +300,56 @@ def save_siglip_action_clips_index(video_id: str, embeddings: np.ndarray):
 
 def load_siglip_action_clips_index(video_id: str):
     index = faiss.read_index(SACLIP_PATH(video_id))
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT idx, start, end, objects, caption
-        FROM visual_clips
-        WHERE video_id=?
-        ORDER BY idx
-    """, (video_id,)).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT idx, start, end, objects, caption
+            FROM visual_clips
+            WHERE video_id=?
+            ORDER BY idx
+        """, (video_id,)).fetchall()
     return index, rows
 
 # --- Metadata-only writers (for SigLIP-only ingest; no caption FAISS index) ---
 def save_visual_metadata(video_id: str, chunks: list[dict]):
     """Write per-frame metadata rows without building a caption FAISS index.
     Used when visual ingest relies on SigLIP alone; caption/objects may be empty."""
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
-        [(video_id, i, c["start"], c["end"], c["frame"],
-          json.dumps(c.get("objects", [])), c.get("caption", ""))
-         for i, c in enumerate(chunks)]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO visual_chunks(video_id, idx, start, end, frame, objects, caption) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            [(video_id, i, c["start"], c["end"], c["frame"],
+              json.dumps(c.get("objects", [])), c.get("caption", ""))
+             for i, c in enumerate(chunks)]
+        )
+        conn.commit()
 
 def save_action_clips_metadata(video_id: str, rows: list[dict]):
     """Write per-action-clip metadata rows without building a caption FAISS index."""
-    conn = get_conn()
-    conn.executemany(
-        "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
-        [(video_id, i, r["start"], r["end"],
-          json.dumps(r.get("objects", [])), r.get("caption", ""))
-         for i, r in enumerate(rows)]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO visual_clips(video_id, idx, start, end, objects, caption) VALUES(?,?,?,?,?,?)",
+            [(video_id, i, r["start"], r["end"],
+              json.dumps(r.get("objects", [])), r.get("caption", ""))
+             for i, r in enumerate(rows)]
+        )
+        conn.commit()
 
 # --- Caption cache (lazy Florence-2 output) ---
 def get_cached_captions(video_id: str, frames: list[str]) -> Dict[str, Dict]:
     """Return {frame_path: {caption, objects}} for any cached frames."""
     if not frames:
         return {}
-    conn = get_conn()
     qmarks = ",".join(["?"] * len(frames))
-    rows = conn.execute(
-        f"SELECT frame, caption, objects FROM caption_cache "
-        f"WHERE video_id=? AND frame IN ({qmarks})",
-        (video_id, *frames)
-    ).fetchall()
-    conn.close()
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT frame, caption, objects FROM caption_cache "
+            f"WHERE video_id=? AND frame IN ({qmarks})",
+            (video_id, *frames)
+        ).fetchall()
     out = {}
     for frame, caption, objects in rows:
         try:
             objs = json.loads(objects) if objects else []
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             objs = []
         out[frame] = {"caption": caption or "", "objects": objs}
     return out
@@ -341,19 +358,18 @@ def put_cached_captions(video_id: str, entries: Dict[str, Dict]) -> None:
     """entries: {frame_path: {caption, objects}}"""
     if not entries:
         return
-    conn = get_conn()
-    conn.executemany(
-        """INSERT INTO caption_cache(video_id, frame, caption, objects, updated_at)
-           VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
-           ON CONFLICT(video_id, frame) DO UPDATE SET
-             caption=excluded.caption,
-             objects=excluded.objects,
-             updated_at=CURRENT_TIMESTAMP""",
-        [(video_id, frame, e.get("caption", ""), json.dumps(e.get("objects", [])))
-         for frame, e in entries.items()]
-    )
-    conn.commit()
-    conn.close()
+    with db() as conn:
+        conn.executemany(
+            """INSERT INTO caption_cache(video_id, frame, caption, objects, updated_at)
+               VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(video_id, frame) DO UPDATE SET
+                 caption=excluded.caption,
+                 objects=excluded.objects,
+                 updated_at=CURRENT_TIMESTAMP""",
+            [(video_id, frame, e.get("caption", ""), json.dumps(e.get("objects", [])))
+             for frame, e in entries.items()]
+        )
+        conn.commit()
 
 # --- VIDEO CONTEXT FUNCTIONS ---
 
@@ -523,73 +539,70 @@ def derive_topics_bertopic(texts: list[str], topn: int = 10, min_topic_size: int
 
 def build_video_context(video_id: str) -> None:
     """Build and store video context summary for better search filtering."""
-    conn = get_conn()
-    
     try:
-        # 1) Derive a short summary from ASR
-        summary = derive_text_summary_for(video_id, conn)
-        
-        # 2) Get frequent objects/actions
-        objects_topk = top_objects_for(video_id, conn, k=20)
-        actions_topk = top_actions_for(video_id, conn, k=20)
-        
-        # 3) Derive topics
-        texts = _fetch_texts_for_video(video_id, conn, max_chunks=300)
-        if len(texts) < 10:
-            topics = derive_topics(summary, objects_topk, actions_topk, texts, topn=10)
-        else:
-            topics = derive_topics_bertopic(texts, topn=10, min_topic_size=5)
+        with db() as conn:
+            # 1) Derive a short summary from ASR
+            summary = derive_text_summary_for(video_id, conn)
 
-        fused_topics = []
-        seen = set()
-        for t in (list(objects_topk.keys())[:5] + list(actions_topk.keys())[:5] + topics):
-            t0 = t.strip().lower()
-            if t0 and t0 not in seen:
-                fused_topics.append(t0); seen.add(t0)
-        
-        # 4) Create embedding
-        text_for_emb = summary or " ".join(fused_topics) or ""
-        if text_for_emb.strip():
-            emb = EMB.encode([text_for_emb], normalize_embeddings=True).astype("float32")[0]
-            emb_blob = emb.tobytes()
-        else:
-            emb_blob = None
-        
-        # 5) Store in database
-        conn.execute("""
-            INSERT INTO video_context (video_id, title, source_url, summary, topics,
-                                     objects_topk, actions_topk, lang, emb, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(video_id) DO UPDATE SET
-              summary=excluded.summary,
-              topics=excluded.topics,
-              objects_topk=excluded.objects_topk,
-              actions_topk=excluded.actions_topk,
-              emb=excluded.emb,
-              updated_at=CURRENT_TIMESTAMP
-        """, (
-            video_id,
-            None,  # title - can be set later
-            None,  # source_url - can be set later
-            summary,
-            json.dumps(fused_topics),
-            json.dumps(objects_topk),
-            json.dumps(actions_topk),
-            "en",  # lang - could detect later
-            emb_blob
-        ))
-        conn.commit()
-        print(f"Built video context for {video_id}: {len(fused_topics)} topics, {len(objects_topk)} objects, {len(actions_topk)} actions")
-        
-    except Exception as e:
-        print(f"Error building video context for {video_id}: {e}")
-    finally:
-        conn.close()
+            # 2) Get frequent objects/actions
+            objects_topk = top_objects_for(video_id, conn, k=20)
+            actions_topk = top_actions_for(video_id, conn, k=20)
+
+            # 3) Derive topics
+            texts = _fetch_texts_for_video(video_id, conn, max_chunks=300)
+            if len(texts) < 10:
+                topics = derive_topics(summary, objects_topk, actions_topk, texts, topn=10)
+            else:
+                topics = derive_topics_bertopic(texts, topn=10, min_topic_size=5)
+
+            fused_topics = []
+            seen = set()
+            for t in (list(objects_topk.keys())[:5] + list(actions_topk.keys())[:5] + topics):
+                t0 = t.strip().lower()
+                if t0 and t0 not in seen:
+                    fused_topics.append(t0); seen.add(t0)
+
+            # 4) Create embedding
+            text_for_emb = summary or " ".join(fused_topics) or ""
+            if text_for_emb.strip():
+                emb = EMB.encode([text_for_emb], normalize_embeddings=True).astype("float32")[0]
+                emb_blob = emb.tobytes()
+            else:
+                emb_blob = None
+
+            # 5) Store in database
+            conn.execute("""
+                INSERT INTO video_context (video_id, title, source_url, summary, topics,
+                                         objects_topk, actions_topk, lang, emb, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(video_id) DO UPDATE SET
+                  summary=excluded.summary,
+                  topics=excluded.topics,
+                  objects_topk=excluded.objects_topk,
+                  actions_topk=excluded.actions_topk,
+                  emb=excluded.emb,
+                  updated_at=CURRENT_TIMESTAMP
+            """, (
+                video_id,
+                None,  # title - can be set later
+                None,  # source_url - can be set later
+                summary,
+                json.dumps(fused_topics),
+                json.dumps(objects_topk),
+                json.dumps(actions_topk),
+                "en",  # lang - could detect later
+                emb_blob
+            ))
+            conn.commit()
+        logger.info("Built video context for %s: %d topics, %d objects, %d actions",
+                    video_id, len(fused_topics), len(objects_topk), len(actions_topk))
+
+    except Exception:
+        logger.exception("Error building video context for %s", video_id)
 
 def _fetch_contexts(video_ids: Optional[List[str]] = None) -> List[Dict]:
     """Fetch video contexts from database."""
-    conn = get_conn()
-    try:
+    with db() as conn:
         if video_ids:
             qmarks = ",".join(["?"] * len(video_ids))
             rows = conn.execute(f"""
@@ -602,19 +615,17 @@ def _fetch_contexts(video_ids: Optional[List[str]] = None) -> List[Dict]:
                 SELECT video_id, topics, objects_topk, actions_topk, emb
                 FROM video_context
             """).fetchall()
-        
-        contexts = []
-        for vid, topics, objs, acts, emb in rows:
-            contexts.append({
-                "video_id": vid,
-                "topics": json.loads(topics or "[]"),
-                "objects_topk": json.loads(objs or "{}"),
-                "actions_topk": json.loads(acts or "{}"),
-                "emb": np.frombuffer(emb, dtype=np.float32) if emb else None
-            })
-        return contexts
-    finally:
-        conn.close()
+
+    contexts = []
+    for vid, topics, objs, acts, emb in rows:
+        contexts.append({
+            "video_id": vid,
+            "topics": json.loads(topics or "[]"),
+            "objects_topk": json.loads(objs or "{}"),
+            "actions_topk": json.loads(acts or "{}"),
+            "emb": np.frombuffer(emb, dtype=np.float32) if emb else None
+        })
+    return contexts
 
 def filter_videos_by_context(query: str,
                            restrict_videos: Optional[List[str]] = None,

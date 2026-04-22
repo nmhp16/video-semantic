@@ -195,6 +195,27 @@ class SigLIPEncoder:
                 print(f"  siglip {min(i + batch_size, len(pil_images))}/{len(pil_images)} frames")
         return np.concatenate(all_embs, axis=0).astype("float32")
 
+    def encode_image_paths(self, paths: List[str], batch_size: int = 16) -> np.ndarray:
+        """Encode frames by path, opening only `batch_size` images at a time.
+        Avoids holding every PIL image in memory simultaneously."""
+        all_embs = []
+        total = len(paths)
+        for i in range(0, total, batch_size):
+            batch_paths = paths[i:i + batch_size]
+            batch = [Image.open(p).convert("RGB") for p in batch_paths]
+            try:
+                inputs = self.processor(images=batch, return_tensors="pt").to(self._device)
+                with torch.no_grad():
+                    feats = self.model.get_image_features(**inputs)
+                feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                all_embs.append(feats.float().cpu().numpy())
+            finally:
+                for img in batch:
+                    img.close()
+            if (i + batch_size) % 64 == 0 or i + batch_size >= total:
+                print(f"  siglip {min(i + batch_size, total)}/{total} frames")
+        return np.concatenate(all_embs, axis=0).astype("float32")
+
     def encode_text(self, texts: List[str]) -> np.ndarray:
         inputs = self.processor(
             text=texts, return_tensors="pt", padding="max_length", truncation=True
@@ -278,13 +299,11 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: floa
     out_dir = os.path.join(FRAMES, video_id)
     frames = sample_frames(src, out_dir, max_gap_sec=max_gap_sec, scene_thresh=scene_thresh)
 
-    # Load frames once
-    pil_images = [Image.open(f["path"]).convert("RGB") for f in frames]
-
-    # SigLIP frame embeddings (direct vision-text contrastive space — no captioning)
+    # SigLIP frame embeddings (direct vision-text contrastive space — no captioning).
+    # Encode in batches directly from disk so we never hold every frame in RAM.
     print(f"SigLIP-encoding {len(frames)} frames...")
     siglip = SigLIPEncoder("google/siglip-base-patch16-224")
-    siglip_embs = siglip.encode_images(pil_images, batch_size=16)
+    siglip_embs = siglip.encode_image_paths([f["path"] for f in frames], batch_size=16)
 
     # Placeholder captions_data — captions are generated lazily at query time.
     # build_caption_windows only uses the 'objects' field for aggregation, which

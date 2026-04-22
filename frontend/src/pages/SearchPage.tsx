@@ -91,6 +91,7 @@ export function SearchPage() {
   const [searched, setSearched] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [ingestOpen, setIngestOpen] = useState(false)
+  const [libraryError, setLibraryError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const fetchVideos = useCallback(async () => {
@@ -98,8 +99,11 @@ export function SearchPage() {
       const res = await api.getVideos()
       setVideos(res.videos)
       setSelectedVideo((prev) => prev || res.videos[0]?.video_id || '')
-    } catch {
-      /* backend may not be running */
+      setLibraryError(null)
+    } catch (e) {
+      setLibraryError(
+        e instanceof Error ? e.message : 'Could not reach backend',
+      )
     }
   }, [])
 
@@ -173,6 +177,13 @@ export function SearchPage() {
           Add video
         </Button>
       </div>
+
+      {libraryError && (
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2.5">
+          <p className="text-sm font-medium text-red-400">Backend unreachable</p>
+          <p className="mt-0.5 text-xs text-muted break-all">{libraryError}</p>
+        </div>
+      )}
 
       {/* Search input area */}
       <div className="space-y-3">
