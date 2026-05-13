@@ -9,6 +9,7 @@ from store import (
     save_visual_metadata, save_action_clips_metadata,
     save_siglip_visual_index, save_siglip_action_clips_index,
 )
+from db import put_cached_captions
 import re
 from pathlib import Path
 from ingest import extract_audio
@@ -305,10 +306,19 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: floa
     siglip = SigLIPEncoder("google/siglip-base-patch16-224")
     siglip_embs = siglip.encode_image_paths([f["path"] for f in frames], batch_size=16)
 
-    # Placeholder captions_data — captions are generated lazily at query time.
-    # build_caption_windows only uses the 'objects' field for aggregation, which
-    # is an empty list when captions aren't pre-generated.
-    captions_data = [{"caption": "", "objects": []} for _ in frames]
+    # Florence-2 captions generated now so search queries return immediately.
+    print(f"Florence-2 captioning {len(frames)} frames...")
+    captioner = Florence2Captioner("microsoft/Florence-2-base")
+    captions_data = []
+    for i, f in enumerate(frames):
+        img = Image.open(f["path"]).convert("RGB")
+        captions_data.append(captioner.process_image(img))
+        if (i + 1) % 10 == 0:
+            print(f"  captioned {i+1}/{len(frames)} frames")
+
+    frame_rel = [os.path.relpath(f["path"], start=os.path.dirname(DATA)) for f in frames]
+    put_cached_captions(video_id, {k: v for k, v in zip(frame_rel, captions_data)})
+    print(f"Cached {len(captions_data)} captions for {video_id}")
 
     # Action clips: sliding windows over SigLIP frame embeddings
     siglip_clip_vecs, clip_rows = build_caption_windows(
@@ -318,15 +328,14 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: floa
     save_action_clips_metadata(video_id, clip_rows)
     print(f"ACTION CLIPS OK: {video_id} | clips={len(siglip_clip_vecs)}")
 
-    # Frame-level metadata rows (captions/objects empty; filled lazily on query)
     rows = []
     for i, f in enumerate(frames):
         rows.append({
             "start": float(f["t"]),
             "end":   float(f["t_end"]),
             "frame": os.path.relpath(f["path"], start=os.path.dirname(DATA)),
-            "objects": [],
-            "caption": "",
+            "objects": captions_data[i]["objects"],
+            "caption": captions_data[i]["caption"],
         })
 
     save_siglip_visual_index(video_id, siglip_embs)
