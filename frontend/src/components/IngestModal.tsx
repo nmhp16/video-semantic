@@ -1,32 +1,56 @@
-import { useState } from 'react'
-import { CheckCircle, AlertCircle, ArrowRight } from 'lucide-react'
+// frontend/src/components/IngestModal.tsx
+import { useState, useEffect, useRef } from 'react'
+import { CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Spinner } from '@/components/ui/spinner'
 import { api } from '@/lib/api'
-import type { IngestResponse } from '@/lib/api'
+import type { JobStatusResponse } from '@/lib/api'
 
 interface IngestModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSuccess: (res: IngestResponse) => void
+  onSuccess: () => void
+}
+
+const STAGES = [
+  'Downloading & extracting frames…',
+  'Transcribing audio…',
+  'Building context…',
+]
+
+function stageIndex(stage: string): number {
+  return STAGES.findIndex((s) => s === stage)
 }
 
 export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps) {
   const [url, setUrl] = useState('')
   const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState<IngestResponse | null>(null)
+  const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null)
+  const [alreadyExists, setAlreadyExists] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }
+
+  useEffect(() => {
+    return () => stopPolling()
+  }, [])
 
   const handleClose = (val: boolean) => {
-    if (!loading) {
-      onOpenChange(val)
-      if (!val) {
-        setUrl('')
-        setResult(null)
-        setError(null)
-      }
+    if (loading) return
+    stopPolling()
+    onOpenChange(val)
+    if (!val) {
+      setUrl('')
+      setJobStatus(null)
+      setAlreadyExists(false)
+      setError(null)
     }
   }
 
@@ -34,25 +58,53 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
     if (!url.trim()) return
     setLoading(true)
     setError(null)
-    setResult(null)
+    setJobStatus(null)
+    setAlreadyExists(false)
     try {
       const res = await api.ingest(url.trim())
-      setResult(res)
-      onSuccess(res)
+      if (res.status === 'already_exists') {
+        setAlreadyExists(true)
+        setLoading(false)
+        onSuccess()
+        return
+      }
+      if (!res.job_id) {
+        setError('No job ID returned')
+        setLoading(false)
+        return
+      }
+      const jobId = res.job_id
+      pollRef.current = setInterval(async () => {
+        try {
+          const status = await api.ingestStatus(jobId)
+          setJobStatus(status)
+          if (status.status === 'done') {
+            stopPolling()
+            setLoading(false)
+            onSuccess()
+          } else if (status.status === 'error') {
+            stopPolling()
+            setError(status.error ?? 'Ingestion failed')
+            setLoading(false)
+          }
+        } catch (e) {
+          stopPolling()
+          setError(e instanceof Error ? e.message : 'Polling failed')
+          setLoading(false)
+        }
+      }, 2000)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Ingestion failed')
-    } finally {
       setLoading(false)
     }
   }
 
+  const done = jobStatus?.status === 'done'
+  const currentStageIdx = jobStatus ? stageIndex(jobStatus.stage) : -1
+
   return (
-    <Dialog
-      open={open}
-      onOpenChange={handleClose}
-      title="Add video"
-      description="Paste a YouTube URL to ingest and index."
-    >
+    <Dialog open={open} onOpenChange={handleClose} title="Add video"
+            description="Paste a YouTube URL to ingest and index.">
       <div className="space-y-4">
         <div className="space-y-1.5">
           <label className="text-xxs font-medium uppercase tracking-wide text-subtle">
@@ -62,42 +114,56 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
             placeholder="https://www.youtube.com/watch?v=…"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleIngest()}
+            onKeyDown={(e) => e.key === 'Enter' && !loading && handleIngest()}
             disabled={loading}
             autoFocus
           />
         </div>
 
-        <ul className="space-y-1 text-xs text-muted">
-          <li className="flex items-start gap-2">
-            <ArrowRight className="h-3 w-3 mt-0.5 flex-shrink-0 text-subtle" />
-            Whisper transcription, scene-change frame sampling, and SigLIP indexing.
-          </li>
-          <li className="flex items-start gap-2">
-            <ArrowRight className="h-3 w-3 mt-0.5 flex-shrink-0 text-subtle" />
-            Captions are generated lazily on the first visual or action query.
-          </li>
-        </ul>
-
-        {loading && (
-          <div className="flex items-center gap-3 rounded-md border border-accent/30 bg-accent-soft px-3 py-2.5">
-            <Spinner size="sm" className="text-accent" />
-            <div className="text-xs">
-              <p className="font-medium text-accent">Processing…</p>
-              <p className="text-muted">This may take a minute or two.</p>
-            </div>
+        {loading && jobStatus && (
+          <div className="space-y-2 rounded-md border border-accent/30 bg-accent-soft px-3 py-2.5">
+            {STAGES.map((stage, i) => {
+              const completed = currentStageIdx > i || done
+              const active = currentStageIdx === i && !done
+              return (
+                <div key={stage} className="flex items-center gap-2 text-xs">
+                  {completed ? (
+                    <CheckCircle className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" />
+                  ) : active ? (
+                    <Loader2 className="h-3.5 w-3.5 text-accent animate-spin flex-shrink-0" />
+                  ) : (
+                    <span className="h-3.5 w-3.5 rounded-full border border-border flex-shrink-0" />
+                  )}
+                  <span className={active ? 'text-accent font-medium' : completed ? 'text-muted line-through' : 'text-dim'}>
+                    {stage}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         )}
 
-        {result && (
+        {loading && !jobStatus && (
+          <div className="flex items-center gap-3 rounded-md border border-accent/30 bg-accent-soft px-3 py-2.5">
+            <Loader2 className="h-4 w-4 animate-spin text-accent" />
+            <p className="text-xs font-medium text-accent">Starting…</p>
+          </div>
+        )}
+
+        {alreadyExists && (
+          <div className="flex items-start gap-2.5 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2.5">
+            <CheckCircle className="h-4 w-4 mt-0.5 flex-shrink-0 text-emerald-400" />
+            <p className="text-xs font-medium text-emerald-400">Already indexed</p>
+          </div>
+        )}
+
+        {done && (
           <div className="flex items-start gap-2.5 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2.5">
             <CheckCircle className="h-4 w-4 mt-0.5 flex-shrink-0 text-emerald-400" />
             <div className="text-xs">
-              <p className="font-medium text-emerald-400">
-                {result.status === 'already_exists' ? 'Already indexed' : 'Done'}
-              </p>
+              <p className="font-medium text-emerald-400">Done</p>
               <p className="text-muted">
-                Video ID <span className="font-mono text-fg">{result.video_id}</span>
+                Video ID <span className="font-mono text-fg">{jobStatus?.video_id}</span>
               </p>
             </div>
           </div>
@@ -114,20 +180,14 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
         )}
 
         <div className="flex gap-2 pt-1">
-          {result ? (
+          {done || alreadyExists ? (
             <Button variant="primary" size="md" className="flex-1" onClick={() => handleClose(false)}>
               Done
             </Button>
           ) : (
-            <Button
-              variant="primary"
-              size="md"
-              className="flex-1"
-              onClick={handleIngest}
-              disabled={loading || !url.trim()}
-            >
-              {loading ? <Spinner size="sm" /> : null}
-              {loading ? 'Ingesting' : 'Ingest'}
+            <Button variant="primary" size="md" className="flex-1"
+                    onClick={handleIngest} disabled={loading || !url.trim()}>
+              {loading ? 'Ingesting…' : 'Ingest'}
             </Button>
           )}
           <Button variant="secondary" size="md" onClick={() => handleClose(false)} disabled={loading}>
