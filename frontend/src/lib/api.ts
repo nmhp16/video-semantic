@@ -1,11 +1,20 @@
+// frontend/src/lib/api.ts
 const BASE_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:8000'
 
 export interface VideoMeta {
   video_id: string
+  title: string | null
+  source_url: string | null
   has_text_search: boolean
   has_visual_search: boolean
   has_action_search: boolean
   thumbnail_url?: string | null
+  top_objects: string[]
+}
+
+export interface ScoreRange {
+  min: number
+  max: number
 }
 
 export interface UnifiedSearchHit {
@@ -24,6 +33,22 @@ export interface UnifiedSearchResponse {
   mode: 'text' | 'visual' | 'action' | 'action_chain'
   hits: UnifiedSearchHit[]
   info: Record<string, unknown>
+  score_range: ScoreRange | null
+}
+
+export interface IngestJobResponse {
+  job_id: string | null
+  video_id: string
+  status: 'queued' | 'already_exists'
+  message?: string
+}
+
+export interface JobStatusResponse {
+  job_id: string
+  video_id: string
+  status: 'queued' | 'running' | 'done' | 'error'
+  stage: string
+  error: string | null
 }
 
 export interface IngestResponse {
@@ -66,11 +91,23 @@ export const api = {
     return request('/videos')
   },
 
-  ingest(video_url: string, video_id?: string): Promise<IngestResponse> {
+  ingest(video_url: string, video_id?: string): Promise<IngestJobResponse> {
     return request('/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ video_url, video_id }),
+    })
+  },
+
+  ingestStatus(jobId: string): Promise<JobStatusResponse> {
+    return request(`/ingest/status/${encodeURIComponent(jobId)}`)
+  },
+
+  buildContexts(videoIds?: string[]): Promise<{ success: boolean; message: string }> {
+    return request('/build_contexts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(videoIds ?? null),
     })
   },
 
@@ -91,8 +128,6 @@ export const api = {
   },
 
   frameUrl(framePath: string): string {
-    // frames stored as e.g. "data/frames/video_id/frame_0042.jpg"
-    // strip leading "data/frames/" or "frames/" prefix
     const match = framePath.match(/(?:data\/)?frames\/(.+)/)
     const rel = match ? match[1] : framePath
     return `${BASE_URL}/frames/${rel}`
