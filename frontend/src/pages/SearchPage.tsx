@@ -14,6 +14,8 @@ import type {
   UnifiedSearchHit,
   VideoMeta,
 } from '@/lib/api'
+import { useSearchHistory } from '@/hooks/useSearchHistory'
+import type { ScoreRange } from '@/lib/api'
 
 function ChainStepsInput({
   steps,
@@ -92,7 +94,18 @@ export function SearchPage() {
   const [error, setError] = useState<string | null>(null)
   const [ingestOpen, setIngestOpen] = useState(false)
   const [libraryError, setLibraryError] = useState<string | null>(null)
+  const [scoreRange, setScoreRange] = useState<ScoreRange | null>(null)
+  const { history, push: pushHistory, remove: removeHistory } = useSearchHistory()
+  const [inputFocused, setInputFocused] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+
+  const videoTitles = Object.fromEntries(
+    videos.filter((v) => v.title).map((v) => [v.video_id, v.title!])
+  )
+
+  const objectSuggestions = scope === 'video'
+    ? (videos.find((v) => v.video_id === selectedVideo)?.top_objects ?? [])
+    : [...new Set(videos.flatMap((v) => v.top_objects ?? []))].slice(0, 20)
 
   const fetchVideos = useCallback(async () => {
     try {
@@ -148,13 +161,17 @@ export function SearchPage() {
         ingest_if_needed: false,
       })
       setHits(res.hits)
+      setScoreRange(res.score_range ?? null)
+      if (!isChain && effectiveQuery) {
+        pushHistory(effectiveQuery, mode)
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed')
       setHits([])
     } finally {
       setLoading(false)
     }
-  }, [query, mode, scope, selectedVideo, filterObjects, chainSteps])
+  }, [query, mode, scope, selectedVideo, filterObjects, chainSteps, pushHistory])
 
   const handleModeChange = (m: SearchMode) => {
     setMode(m)
@@ -188,32 +205,61 @@ export function SearchPage() {
       {/* Search input area */}
       <div className="space-y-3">
         {mode !== 'action_chain' ? (
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-subtle pointer-events-none" />
-              <input
-                ref={inputRef}
-                className="w-full h-11 pl-10 pr-20 rounded-lg border border-border bg-surface text-sm text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
-                placeholder={PLACEHOLDERS[mode]}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-              />
-              <span className="absolute right-3 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 pointer-events-none">
-                <span className="kbd">⌘</span>
-                <span className="kbd">K</span>
-              </span>
+          <>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-subtle pointer-events-none" />
+                <input
+                  ref={inputRef}
+                  className="w-full h-11 pl-10 pr-20 rounded-lg border border-border bg-surface text-sm text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
+                  placeholder={PLACEHOLDERS[mode]}
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                  onFocus={() => setInputFocused(true)}
+                  onBlur={() => setTimeout(() => setInputFocused(false), 150)}
+                />
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 pointer-events-none">
+                  <span className="kbd">⌘</span>
+                  <span className="kbd">K</span>
+                </span>
+              </div>
+              <Button
+                variant="primary"
+                size="lg"
+                onClick={handleSearch}
+                disabled={loading || !query.trim()}
+              >
+                {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
+                Search
+              </Button>
             </div>
-            <Button
-              variant="primary"
-              size="lg"
-              onClick={handleSearch}
-              disabled={loading || !query.trim()}
-            >
-              {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
-              Search
-            </Button>
-          </div>
+            {inputFocused && history.length > 0 && !query && (
+              <div className="flex flex-wrap gap-1.5">
+                {history.map((entry) => (
+                  <button
+                    key={`${entry.query}-${entry.mode}`}
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      setQuery(entry.query)
+                      setMode(entry.mode)
+                      setTimeout(() => handleSearch(), 0)
+                    }}
+                    className="group inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-xs text-muted hover:border-border-strong hover:text-fg transition-colors"
+                  >
+                    <span>{entry.query}</span>
+                    <span className="text-[10px] text-dim">{entry.mode}</span>
+                    <span
+                      onMouseDown={(e) => { e.stopPropagation(); removeHistory(entry.query, entry.mode) }}
+                      className="ml-0.5 text-dim hover:text-red-400 cursor-pointer"
+                    >
+                      ×
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
         ) : (
           <div className="space-y-3">
             <ChainStepsInput steps={chainSteps} onChange={setChainSteps} />
@@ -242,6 +288,7 @@ export function SearchPage() {
           onScopeChange={setScope}
           filterObjects={filterObjects}
           onFilterObjectsChange={setFilterObjects}
+          objectSuggestions={objectSuggestions}
         />
       </div>
 
@@ -297,7 +344,13 @@ export function SearchPage() {
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
               {hits.map((hit, i) => (
-                <ResultCard key={`${hit.video_id}-${hit.start}-${i}`} hit={hit} index={i} />
+                <ResultCard
+                  key={`${hit.video_id}-${hit.start}-${i}`}
+                  hit={hit}
+                  index={i}
+                  title={videoTitles[hit.video_id]}
+                  scoreRange={scoreRange}
+                />
               ))}
             </div>
           </div>
