@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ExternalLink, Trash2 } from 'lucide-react'
+import { ExternalLink, RefreshCw, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
 import { cn, isYouTubeId, youtubeUrl } from '@/lib/utils'
@@ -11,6 +11,7 @@ interface VideoLibraryProps {
   loading: boolean
   onSelect?: (videoId: string) => void
   onDeleted?: (videoId: string) => void
+  onReindex?: (videoId: string) => void
 }
 
 function StatusDot({ active, label }: { active: boolean; label: string }) {
@@ -57,6 +58,7 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [reindexing, setReindexing] = useState<string | null>(null)
 
   const handleDelete = async (videoId: string) => {
     setDeleting(videoId)
@@ -72,6 +74,15 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
     }
   }
 
+  const handleReindex = async (videoId: string) => {
+    setReindexing(videoId)
+    try {
+      await api.buildContexts([videoId])
+    } finally {
+      setReindexing(null)
+    }
+  }
+
   if (loading) {
     return (
       <div className="rounded-lg border border-border bg-panel overflow-hidden">
@@ -79,7 +90,7 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
           <thead>
             <tr className="border-b border-border bg-surface/50">
               <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle"> </th>
-              <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Video</th>
+              <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Title / ID</th>
               <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Indexes</th>
               <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">Ready</th>
               <th className="px-4 py-2.5 text-right text-xxs font-medium uppercase tracking-wide text-subtle"> </th>
@@ -119,7 +130,7 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
           <tr className="border-b border-border bg-surface/50">
             <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle w-20"> </th>
             <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">
-              Video
+              Title / ID
             </th>
             <th className="px-4 py-2.5 text-left text-xxs font-medium uppercase tracking-wide text-subtle">
               Indexes
@@ -149,7 +160,21 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
                   <Thumbnail video={v} />
                 </td>
                 <td className="px-4 py-3">
-                  <span className="font-mono text-sm text-fg">{v.video_id}</span>
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm font-medium text-fg truncate max-w-xs">
+                      {v.title ?? v.video_id}
+                    </span>
+                    {v.title && (
+                      <span className="font-mono text-[10px] text-dim">{v.video_id}</span>
+                    )}
+                    {v.source_url && (
+                      <a href={v.source_url} target="_blank" rel="noreferrer noopener"
+                         onClick={(e) => e.stopPropagation()}
+                         className="inline-flex items-center gap-1 text-[10px] text-subtle hover:text-fg transition-colors">
+                        Source <ExternalLink className="h-2.5 w-2.5" />
+                      </a>
+                    )}
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-4">
@@ -165,6 +190,16 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
                 </td>
                 <td className="px-4 py-3 text-right">
                   <div className="flex items-center justify-end gap-3">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleReindex(v.video_id) }}
+                      disabled={reindexing === v.video_id}
+                      title="Rebuild context index"
+                      className="rounded-md p-1 text-subtle hover:text-fg hover:bg-surface2 transition-colors disabled:opacity-40"
+                    >
+                      {reindexing === v.video_id
+                        ? <Spinner size="sm" />
+                        : <RefreshCw className="h-3.5 w-3.5" />}
+                    </button>
                     {isYouTubeId(v.video_id) && (
                       <a
                         href={youtubeUrl(v.video_id)}

@@ -64,6 +64,7 @@ export function LibraryPage() {
         loading={loading}
         onSelect={(id) => navigate(`/?video=${encodeURIComponent(id)}`)}
         onDeleted={() => fetchVideos()}
+        onReindex={(id) => console.log('reindex', id)}
       />
 
       <IngestModal
