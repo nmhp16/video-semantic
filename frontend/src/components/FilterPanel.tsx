@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { ChevronDown, Globe, Video } from 'lucide-react'
-import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import type { VideoMeta, SearchScope } from '@/lib/api'
 
@@ -12,6 +11,7 @@ interface FilterPanelProps {
   onScopeChange: (scope: SearchScope) => void
   filterObjects: string
   onFilterObjectsChange: (val: string) => void
+  objectSuggestions: string[]
 }
 
 function SegmentedScope({
@@ -56,6 +56,7 @@ export function FilterPanel({
   onScopeChange,
   filterObjects,
   onFilterObjectsChange,
+  objectSuggestions,
 }: FilterPanelProps) {
   const [open, setOpen] = useState(false)
 
@@ -85,7 +86,7 @@ export function FilterPanel({
               >
                 {videos.map((v) => (
                   <option key={v.video_id} value={v.video_id}>
-                    {v.video_id}
+                    {v.title ?? v.video_id}
                   </option>
                 ))}
               </select>
@@ -114,12 +115,18 @@ export function FilterPanel({
             <label className="block text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">
               Filter by keyword
             </label>
-            <Input
+            <input
+              list="filter-objects-list"
               placeholder="person, knife, cutting board"
               value={filterObjects}
               onChange={(e) => onFilterObjectsChange(e.target.value)}
-              className="h-8 text-xs"
+              className="h-8 w-full rounded-md border border-border bg-surface px-3 text-xs text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
             />
+            <datalist id="filter-objects-list">
+              {objectSuggestions.map((obj) => (
+                <option key={obj} value={obj} />
+              ))}
+            </datalist>
             <p className="mt-1 text-xxs text-subtle">
               Matches words in the lazy-generated caption for each frame.
             </p>
