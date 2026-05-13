@@ -61,9 +61,30 @@ class UnifiedSearchResponse(BaseModel):
     mode: MODE
     hits: List[UnifiedSearchHit] = Field(default_factory=list)
     info: dict = Field(default_factory=dict)   # extra info (e.g., chosen path for action_chain)
+    score_range: Optional["ScoreRange"] = None
 
 class OVVerifyRequest(BaseModel):
     frames: List[str]
     prompts: List[str]
     box_threshold: float = 0.25
     text_threshold: float = 0.25
+
+class ScoreRange(BaseModel):
+    min: float
+    max: float
+
+class IngestJobResponse(BaseModel):
+    job_id: Optional[str]
+    video_id: str
+    status: str   # "queued" | "already_exists"
+    message: Optional[str] = None
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    video_id: str
+    status: str   # "queued" | "running" | "done" | "error"
+    stage: str
+    error: Optional[str] = None
+
+# Resolve forward references now that all models are defined
+UnifiedSearchResponse.model_rebuild()
