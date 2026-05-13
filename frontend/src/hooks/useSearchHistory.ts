@@ -11,9 +11,12 @@ export interface HistoryEntry {
   timestamp: number
 }
 
+const VALID_MODES: SearchMode[] = ['text', 'visual', 'action']
+
 function load(): HistoryEntry[] {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    const entries: HistoryEntry[] = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    return entries.filter((e) => VALID_MODES.includes(e.mode))
   } catch {
     return []
   }

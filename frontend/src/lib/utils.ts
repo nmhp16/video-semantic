@@ -15,13 +15,6 @@ export function formatTimeRange(start: number, end: number): string {
   return `${formatTime(start)} – ${formatTime(end)}`
 }
 
-export function scorePercent(score: number): number {
-  // Scores are cosine similarities on normalized embeddings. Most relevant
-  // hits land in [0.1, 0.8] depending on the backbone (SigLIP vs bge).
-  // Report the raw cosine as a percentage, clamped to [0, 100].
-  return Math.round(Math.max(0, Math.min(1, score)) * 100)
-}
-
 export function isYouTubeId(videoId: string): boolean {
   return /^[a-zA-Z0-9_-]{11}$/.test(videoId)
 }

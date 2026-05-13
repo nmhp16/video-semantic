@@ -65,7 +65,6 @@ def init_db() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_video ON chunks(video_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_visual_chunks_video ON visual_chunks(video_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_visual_clips_video ON visual_clips(video_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_caption_cache_video ON caption_cache(video_id)")
     conn.commit()
     conn.close()
 
@@ -73,8 +72,6 @@ def init_db() -> None:
 @contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
     finally:
@@ -90,7 +87,7 @@ def clear_video(video_id: str) -> dict:
     indexes_dir = os.path.join(DATA, "indexes")
     media_dir   = os.path.join(DATA, "media")
     frames_dir  = os.path.join(DATA, "frames", video_id)
-    exts = [".faiss", ".json", ".vfaiss", ".aclip.faiss", ".svfaiss", ".saclip.faiss"]
+    exts = [".faiss", ".json", ".svfaiss", ".saclip.faiss", ".xaclip.faiss"]
     files = [os.path.join(indexes_dir, f"{video_id}{e}") for e in exts]
     files += [os.path.join(media_dir, f"{video_id}.mp4"),
               os.path.join(media_dir, f"{video_id}.wav")]

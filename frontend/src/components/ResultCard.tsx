@@ -55,9 +55,11 @@ export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
   const pct = normalizeScore(hit.score, scoreRange)
   const isYT = isYouTubeId(hit.video_id)
   const hasFrame = Boolean(hit.frame)
-  const hasCaption = Boolean(hit.caption?.trim())
+  const caption = hit.caption || ''
+  const objects = hit.objects ?? []
+  const hasCaption = Boolean(caption.trim())
   const hasText = Boolean(hit.text?.trim())
-  const primaryText = hasText ? hit.text : hasCaption ? hit.caption : null
+  const primaryText = hasText ? hit.text : hasCaption ? caption : null
   const displayName = title ?? hit.video_id
 
   return (
@@ -105,13 +107,13 @@ export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
               {hasText ? `"${truncate(primaryText, 180)}"` : truncate(primaryText, 180)}
             </p>
           )}
-          {hit.objects && hit.objects.length > 0 && (
+          {objects.length > 0 && (
             <div className="flex flex-wrap gap-1 pt-0.5">
-              {hit.objects.slice(0, 4).map((obj) => (
+              {objects.slice(0, 4).map((obj) => (
                 <Badge key={obj} variant="neutral" className="text-[10px] px-1.5 py-0">{obj}</Badge>
               ))}
-              {hit.objects.length > 4 && (
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0">+{hit.objects.length - 4}</Badge>
+              {objects.length > 4 && (
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0">+{objects.length - 4}</Badge>
               )}
             </div>
           )}
@@ -132,14 +134,14 @@ export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
           {hasCaption && (
             <section>
               <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">Caption</h3>
-              <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">{hit.caption}</p>
+              <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">{caption}</p>
             </section>
           )}
-          {hit.objects && hit.objects.length > 0 && (
+          {objects.length > 0 && (
             <section>
               <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">Keywords</h3>
               <div className="flex flex-wrap gap-1.5">
-                {hit.objects.map((obj) => <Badge key={obj} variant="neutral">{obj}</Badge>)}
+                {objects.map((obj) => <Badge key={obj} variant="neutral">{obj}</Badge>)}
               </div>
             </section>
           )}

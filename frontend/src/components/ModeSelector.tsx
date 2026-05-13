@@ -2,10 +2,9 @@ import { cn } from '@/lib/utils'
 import type { SearchMode } from '@/lib/api'
 
 const MODES: { id: SearchMode; label: string; hint: string }[] = [
-  { id: 'text', label: 'Text', hint: 'Transcript search' },
-  { id: 'visual', label: 'Visual', hint: 'Scene and object search' },
-  { id: 'action', label: 'Action', hint: 'Activity search' },
-  { id: 'action_chain', label: 'Chain', hint: 'Ordered action sequence' },
+  { id: 'text', label: 'Text', hint: 'Search spoken words and transcripts' },
+  { id: 'visual', label: 'Visual', hint: 'Search by scene, object, or appearance' },
+  { id: 'action', label: 'Action', hint: 'Search by activity or motion' },
 ]
 
 interface ModeSelectorProps {

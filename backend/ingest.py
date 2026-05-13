@@ -1,17 +1,24 @@
-import os, json, subprocess, re, tempfile
+import os, json, subprocess, re
 from pathlib import Path
 import whisper
-from sentence_transformers import SentenceTransformer
 import numpy as np
 from chunking import chunk_segments
 from store import DATA, save_index
+from embeddings import get_emb
+from utils_unified import YT_ID_RE
+
+_whisper_model = None
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = whisper.load_model("turbo")
+    return _whisper_model
 
 MEDIA = os.path.join(DATA, "media")
 TRANS = os.path.join(DATA, "transcripts")
 os.makedirs(MEDIA, exist_ok=True)
 os.makedirs(TRANS, exist_ok=True)
-
-YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 def _ytdlp_auth_args() -> list[str]:
     """Optional YouTube auth args from env.
@@ -39,14 +46,11 @@ def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])
 
 def transcribe(wav_path: str):
-    model = whisper.load_model("turbo")
-    result = model.transcribe(wav_path, word_timestamps=False)
-    segments = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
-    return segments
+    result = _get_whisper().transcribe(wav_path, word_timestamps=False)
+    return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
 
 def embed_texts(texts: list[str]):
-    model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    X = model.encode(texts, normalize_embeddings=True)
+    X = get_emb().encode(texts, normalize_embeddings=True)
     return np.array(X, dtype="float32")
 
 def ingest(url_or_path: str):

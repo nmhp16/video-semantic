@@ -3,13 +3,15 @@ import os, json, logging
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from models import (
-    SearchResponse, SearchHit, UnifiedSearchRequest,
+    UnifiedSearchRequest,
     UnifiedSearchHit, UnifiedSearchResponse, ScoreRange, MAX_K,
+
 )
 from indexes import (
-    load_index, load_siglip_visual_index, load_siglip_action_clips_index,
+    load_index, load_siglip_visual_index,
+    load_xclip_action_index, has_xclip_action_index,
 )
-from db import get_cached_captions, put_cached_captions
+from db import get_cached_captions
 from context import filter_videos_by_context
 from embeddings import get_emb
 
@@ -20,23 +22,15 @@ BASE = os.path.dirname(os.path.dirname(__file__))
 _indexes_dir = os.path.join(BASE, "data", "indexes")
 _frames_dir  = os.path.join(BASE, "data", "frames")
 
-# SigLIP text tower — lazy
-_SIGLIP = None
-def _get_siglip():
-    global _SIGLIP
-    if _SIGLIP is None:
-        from visual_ingest import SigLIPEncoder
-        _SIGLIP = SigLIPEncoder("google/siglip-base-patch16-224")
-    return _SIGLIP
+# X-CLIP encoder — lazy
+_XCLIP = None
+def _get_xclip():
+    global _XCLIP
+    if _XCLIP is None:
+        from visual_ingest import XCLIPEncoder
+        _XCLIP = XCLIPEncoder()
+    return _XCLIP
 
-# Florence-2 captioner — lazy
-_CAPTIONER = None
-def _get_captioner():
-    global _CAPTIONER
-    if _CAPTIONER is None:
-        from visual_ingest import Florence2Captioner
-        _CAPTIONER = Florence2Captioner("microsoft/Florence-2-base")
-    return _CAPTIONER
 
 
 def _val(h, name, default=None):
@@ -76,7 +70,7 @@ def nms_time(hits, tol=0.5):
     return kept
 
 
-def _caption_hits_lazy(video_id: Optional[str], hits: list) -> None:
+def _caption_hits_from_cache(video_id: Optional[str], hits: list) -> None:
     if not hits:
         return
     by_vid: dict = {}
@@ -85,31 +79,13 @@ def _caption_hits_lazy(video_id: Optional[str], hits: list) -> None:
         if not vid or not h.get("frame"):
             continue
         by_vid.setdefault(vid, []).append(h)
-    captioner = None
     for vid, vhits in by_vid.items():
         frames = [h["frame"] for h in vhits]
         cached = get_cached_captions(vid, frames)
-        missing = [h for h in vhits if h["frame"] not in cached]
-        new_entries: dict = {}
-        if missing:
-            if captioner is None:
-                captioner = _get_captioner()
-            from PIL import Image as _PilImage
-            for h in missing:
-                frame = h["frame"]
-                abs_path = frame if os.path.isabs(frame) else os.path.join(BASE, frame)
-                try:
-                    img = _PilImage.open(abs_path).convert("RGB")
-                    result = captioner.process_image(img)
-                except Exception:
-                    logger.exception("lazy caption failed for %s", frame)
-                    result = {"caption": "", "objects": []}
-                new_entries[frame] = result
-            put_cached_captions(vid, new_entries)
         for h in vhits:
-            entry = cached.get(h["frame"]) or new_entries.get(h["frame"]) or {"caption": "", "objects": []}
+            entry = cached.get(h["frame"]) or {"caption": "", "objects": []}
             h["caption"] = entry["caption"]
-            h["objects"] = entry["objects"]
+            h["objects"] = entry.get("objects") or h.get("objects") or []
 
 
 def _parse_objects(raw: Optional[str]) -> list:
@@ -143,26 +119,6 @@ def _hit_matches_filter(hit: dict, filter_objects: Optional[str]) -> bool:
     return not caption and not objs
 
 
-def _maybe_caption_rerank(hits, *, verify_on, prompts, require_all,
-                           w_base=0.7, w_caption=0.3):
-    if not (verify_on and prompts and hits):
-        return hits
-    terms = [p.strip().lower() for p in prompts if p.strip()]
-    req   = [r.strip().lower() for r in (require_all or []) if r.strip()]
-    for h in hits:
-        cap = (h.get("caption") or "").lower()
-        if not cap:
-            h["verify_score"] = 0.0
-            h["score_fused"] = w_base * float(h.get("score", 0.0))
-            continue
-        matched = sum(1 for t in terms if t in cap)
-        verify = matched / len(terms) if terms else 0.0
-        if req and not all(r in cap for r in req):
-            verify *= 0.3
-        h["verify_score"] = verify
-        h["score_fused"] = w_base * float(h.get("score", 0.0)) + w_caption * verify
-    return hits
-
 
 def _postproc_hits(hits, *, key_mode, k):
     hits = dedupe_hits(hits, key_mode=key_mode)
@@ -174,7 +130,7 @@ def _as_unified(h: dict) -> UnifiedSearchHit:
     return UnifiedSearchHit(
         start=float(h.get("start", 0.0)),
         end=float(h.get("end", h.get("start", 0.0))),
-        score=float(h.get("score_fused", h.get("score", 0.0))),
+        score=float(h.get("score", 0.0)),
         frame=h.get("frame"),
         objects=h.get("objects"),
         caption=h.get("caption"),
@@ -184,7 +140,7 @@ def _as_unified(h: dict) -> UnifiedSearchHit:
 
 
 def _score_range(hits: list) -> ScoreRange:
-    scores = [float(h.get("score_fused", h.get("score", 0.0))) for h in hits]
+    scores = [float(h.get("score", 0.0)) for h in hits]
     if not scores:
         return ScoreRange(min=0.0, max=0.0)
     return ScoreRange(min=min(scores), max=max(scores))
@@ -197,7 +153,8 @@ def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=
     if need_visual:
         ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.svfaiss"))
     if need_action:
-        ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.saclip.faiss"))
+        ok &= (os.path.exists(os.path.join(_indexes_dir, f"{video_id}.xaclip.faiss")) or
+               os.path.exists(os.path.join(_indexes_dir, f"{video_id}.saclip.faiss")))
     return ok
 
 
@@ -242,7 +199,7 @@ def search_text_single(video_id: str, q: str, k: int) -> list:
 
 def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str]) -> list:
     index, rows = load_siglip_visual_index(video_id)
-    qv = _get_siglip().encode_text([q])
+    qv = _get_xclip().encode_text([q])
     D, I = index.search(qv, k)
     out = []
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
@@ -258,8 +215,8 @@ def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional
 
 
 def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional[str]) -> list:
-    index, rows = load_siglip_action_clips_index(video_id)
-    qv = _get_siglip().encode_text([q])
+    index, rows = load_xclip_action_index(video_id)
+    qv = _get_xclip().encode_text([q])
     D, I = index.search(qv, k)
     out = []
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
@@ -301,8 +258,9 @@ def search_visual_global(q: str, k: int, filter_objects=None, restrict_videos=No
 
 
 def search_action_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
+    xclip_vids = set(_globally(".xaclip.faiss", restrict_videos))
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
-    vids = candidates if candidates else _globally(".saclip.faiss", restrict_videos)
+    vids = [v for v in candidates if v in xclip_vids] if candidates else list(xclip_vids)
     all_hits = []
     for vid in vids:
         try:
@@ -313,88 +271,11 @@ def search_action_global(q: str, k: int, filter_objects=None, restrict_videos=No
     return all_hits
 
 
-def chain_actions(video_id: str, steps: list, k_per_step=40, max_gap=8.0,
-                  filter_objects=None):
-    cand = [search_action_single(video_id, q, k_per_step, filter_objects) for q in steps]
-    paths = [[h] for h in cand[0]] if cand and cand[0] else []
-    for t in range(1, len(steps)):
-        new_paths = []
-        for h in cand[t]:
-            best, best_score = None, -1e9
-            for p in paths:
-                prev = p[-1]
-                if h["start"] >= prev["end"] and (h["start"] - prev["end"] <= max_gap):
-                    score = sum(x["score"] for x in p) + h["score"]
-                    if score > best_score:
-                        best, best_score = p, score
-            if best:
-                new_paths.append(best + [h])
-        if not new_paths and cand[t]:
-            new_paths = [[h] for h in cand[t][:3]]
-        paths = new_paths if new_paths else paths
-    paths.sort(key=lambda p: sum(x["score"] for x in p), reverse=True)
-    full = [p for p in paths if len(p) == len(steps)]
-    chosen = full[0] if full else (paths[0] if paths else [])
-    return chosen, cand
 
 
-# ── Legacy GET endpoints (deprecated, kept for backward compat) ──
-
-@router.get("/search", response_model=SearchResponse)
-async def search(video_id: str = Query(...), q: str = Query(...),
-                 k: int = Query(5, ge=1, le=MAX_K)):
-    """Deprecated: use POST /query instead."""
-    index, rows = load_index(video_id)
-    qv = get_emb().encode([q], normalize_embeddings=True).astype("float32")
-    D, I = index.search(qv, k)
-    hits = []
-    for score, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1:
-            continue
-        _, start, end, text = rows[idx]
-        hits.append(SearchHit(start=start, end=end, text=text, score=score))
-    return SearchResponse(video_id=video_id, hits=hits)
+# ── Caption enrichment (called by frontend after results render) ──
 
 
-@router.get("/vsearch")
-async def vsearch(video_id: str = Query(...), q: str = Query(...),
-                  k: int = Query(6, ge=1, le=MAX_K), filter_objects: str = None):
-    """Deprecated: use POST /query with mode=visual instead."""
-    try:
-        hits = search_visual_single(video_id, q, k, filter_objects)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    hits = _postproc_hits(hits, key_mode="auto", k=k)
-    return {"video_id": video_id, "hits": hits}
-
-
-@router.get("/asearch")
-async def asearch(video_id: str = Query(...), q: str = Query(...),
-                  k: int = Query(40, ge=1, le=MAX_K), filter_objects: str = None):
-    """Deprecated: use POST /query with mode=action instead."""
-    try:
-        raw = search_action_single(video_id, q, k, filter_objects)
-        hits = _postproc_hits(raw, key_mode="time", k=k)
-        return {"video_id": video_id, "hits": hits}
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-
-@router.get("/asearch_chain")
-async def asearch_chain(video_id: str = Query(...),
-                        steps: List[str] = Query(...),
-                        k_per_step: int = Query(40, ge=1, le=MAX_K),
-                        max_gap: float = Query(8.0, ge=0.0, le=60.0),
-                        filter_objects: str = None):
-    """Deprecated: use POST /query with mode=action_chain instead."""
-    try:
-        path, cand = chain_actions(video_id, steps, k_per_step=k_per_step,
-                                   max_gap=max_gap, filter_objects=filter_objects)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Action clip index missing: {e}")
-    hits = _postproc_hits(path, key_mode="time", k=None)
-    return {"video_id": video_id, "steps": steps, "best_path": hits,
-            "candidates_preview": [c[:5] for c in cand]}
 
 
 @router.get("/asearch_all")
@@ -425,7 +306,7 @@ def unified_query(body: UnifiedSearchRequest):
             vid,
             need_text=body.mode == "text",
             need_visual=body.mode == "visual",
-            need_action=body.mode in ("action", "action_chain"),
+            need_action=body.mode == "action",
         ):
             from ingest import ingest as do_ingest
             from visual_ingest import ingest_visual as do_visual
@@ -449,13 +330,10 @@ def unified_query(body: UnifiedSearchRequest):
                 raw = search_visual_single(vid, body.query or "", body.k * 3, body.filter_objects)
             except FileNotFoundError:
                 raise HTTPException(404, f"No visual index for video {vid} — ingest first")
-            _caption_hits_lazy(vid, raw)
+            _caption_hits_from_cache(vid, raw)
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
-            raw = _maybe_caption_rerank(raw, verify_on=body.verify_with_gdino,
-                                        prompts=body.verify_prompts or [],
-                                        require_all=body.verify_require_all or [])
-            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="auto", k=body.k)
             return UnifiedSearchResponse(video_id=vid, mode="visual",
@@ -469,35 +347,15 @@ def unified_query(body: UnifiedSearchRequest):
             for h in raw:
                 if not h.get("frame"):
                     h["frame"] = representative_frame_for_segment(vid, h["start"], h["end"])
-            _caption_hits_lazy(vid, raw)
+            _caption_hits_from_cache(vid, raw)
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
-            raw = _maybe_caption_rerank(raw, verify_on=body.verify_with_gdino,
-                                        prompts=body.verify_prompts or [],
-                                        require_all=body.verify_require_all or [])
-            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
             return UnifiedSearchResponse(video_id=vid, mode="action",
                                          hits=[_as_unified(h) for h in raw], score_range=sr)
 
-        if body.mode == "action_chain":
-            if not body.steps:
-                raise HTTPException(400, "steps required for mode=action_chain")
-            path_hits, cand = chain_actions(vid, body.steps, k_per_step=body.k,
-                                            max_gap=body.max_gap,
-                                            filter_objects=body.filter_objects)
-            path_hits = _maybe_caption_rerank(path_hits, verify_on=body.verify_with_gdino,
-                                              prompts=body.verify_prompts or [],
-                                              require_all=body.verify_require_all or [])
-            path_hits.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
-            sr = _score_range(path_hits)
-            path_hits = _postproc_hits(path_hits, key_mode="time", k=body.k)
-            return UnifiedSearchResponse(video_id=vid, mode="action_chain",
-                                         hits=[_as_unified(h) for h in path_hits],
-                                         score_range=sr,
-                                         info={"steps": body.steps,
-                                               "preview_per_step": [c[:5] for c in cand]})
         raise HTTPException(400, f"Unknown mode {body.mode}")
 
     if scope == "global":
@@ -512,13 +370,10 @@ def unified_query(body: UnifiedSearchRequest):
             raw = search_visual_global(body.query or "", body.k * 3,
                                        filter_objects=body.filter_objects,
                                        restrict_videos=restrict)
-            _caption_hits_lazy(None, raw)
+            _caption_hits_from_cache(None, raw)
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
-            raw = _maybe_caption_rerank(raw, verify_on=body.verify_with_gdino,
-                                        prompts=body.verify_prompts or [],
-                                        require_all=body.verify_require_all or [])
-            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="auto", k=body.k)
             return UnifiedSearchResponse(video_id=None, mode="visual",
@@ -531,48 +386,15 @@ def unified_query(body: UnifiedSearchRequest):
             for h in raw:
                 if not h.get("frame"):
                     h["frame"] = representative_frame_for_segment(h["video_id"], h["start"], h["end"])
-            _caption_hits_lazy(None, raw)
+            _caption_hits_from_cache(None, raw)
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
-            raw = _maybe_caption_rerank(raw, verify_on=body.verify_with_gdino,
-                                        prompts=body.verify_prompts or [],
-                                        require_all=body.verify_require_all or [])
-            raw.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
             return UnifiedSearchResponse(video_id=None, mode="action",
                                          hits=[_as_unified(h) for h in raw], score_range=sr)
 
-        if body.mode == "action_chain":
-            if not body.steps:
-                raise HTTPException(400, "steps required for mode=action_chain")
-            vids = _globally(".saclip.faiss", restrict)
-            per_video = []
-            for vid in vids:
-                try:
-                    path_hits, cand = chain_actions(vid, body.steps, k_per_step=body.k,
-                                                    max_gap=body.max_gap,
-                                                    filter_objects=body.filter_objects)
-                    path_hits = _maybe_caption_rerank(path_hits, verify_on=body.verify_with_gdino,
-                                                      prompts=body.verify_prompts or [],
-                                                      require_all=body.verify_require_all or [])
-                    total = sum(float(h.get("score_fused", h.get("score", 0.0))) for h in path_hits)
-                    per_video.append((vid, path_hits, cand, total))
-                except Exception:
-                    continue
-            if not per_video:
-                return UnifiedSearchResponse(video_id=None, mode="action_chain", hits=[],
-                                             info={"steps": body.steps})
-            per_video.sort(key=lambda x: x[3], reverse=True)
-            best_vid, best_path, best_cands, _ = per_video[0]
-            best_path.sort(key=lambda h: float(h.get("score_fused", h.get("score", 0.0))), reverse=True)
-            sr = _score_range(best_path)
-            best_path = _postproc_hits(best_path, key_mode="time", k=body.k)
-            return UnifiedSearchResponse(video_id=best_vid, mode="action_chain",
-                                         hits=[_as_unified(h) for h in best_path],
-                                         score_range=sr,
-                                         info={"steps": body.steps, "selected_video": best_vid,
-                                               "preview_per_step": [c[:5] for c in best_cands]})
         raise HTTPException(400, "Unknown or unsupported mode for scope='global'")
 
     raise HTTPException(400, f"Unknown scope {scope}")

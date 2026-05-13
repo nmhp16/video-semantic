@@ -128,7 +128,7 @@ export function FilterPanel({
               ))}
             </datalist>
             <p className="mt-1 text-xxs text-subtle">
-              Matches words in the lazy-generated caption for each frame.
+              Filters results to frames containing this object or keyword.
             </p>
           </div>
 

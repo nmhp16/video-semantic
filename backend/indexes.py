@@ -10,11 +10,9 @@ BASE = os.path.dirname(__file__)
 DATA = os.path.join(BASE, "data")
 
 INDEX_PATH   = lambda vid: os.path.join(DATA, "indexes", f"{vid}.faiss")
-META_PATH    = lambda vid: os.path.join(DATA, "indexes", f"{vid}.json")
-VINDEX_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.vfaiss")
-ACLIP_PATH   = lambda vid: os.path.join(DATA, "indexes", f"{vid}.aclip.faiss")
 SVINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.svfaiss")
 SACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.saclip.faiss")
+XACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.xaclip.faiss")
 
 # Thread-safe LRU cache for FAISS index objects
 _cache: OrderedDict = OrderedDict()
@@ -62,8 +60,6 @@ def _save_ip_index(path: str, embeddings: np.ndarray):
 def save_index(video_id: str, embeddings: np.ndarray, chunks: list):
     from db import db
     _save_ip_index(INDEX_PATH(video_id), embeddings)
-    with open(META_PATH(video_id), "w") as f:
-        json.dump({"video_id": video_id, "n": len(chunks)}, f)
     with db() as conn:
         conn.executemany(
             "INSERT INTO chunks(video_id, idx, start, end, text) VALUES(?,?,?,?,?)",
@@ -135,12 +131,6 @@ def load_siglip_visual_index(video_id: str):
     return index, rows
 
 
-# --- SigLIP action clips index ---
-def save_siglip_action_clips_index(video_id: str, embeddings: np.ndarray):
-    _save_ip_index(SACLIP_PATH(video_id), embeddings)
-    _cache_put((video_id, "saclip"), faiss.read_index(SACLIP_PATH(video_id)))
-
-
 def load_siglip_action_clips_index(video_id: str):
     from db import db
     key = (video_id, "saclip")
@@ -156,54 +146,18 @@ def load_siglip_action_clips_index(video_id: str):
     return index, rows
 
 
-# --- Legacy visual index (caption-based, still referenced by store.py re-exports) ---
-def save_visual_index(video_id: str, embeddings: np.ndarray, chunks: list):
-    from db import db
-    _save_ip_index(VINDEX_PATH(video_id), embeddings)
-    with db() as conn:
-        conn.executemany(
-            "INSERT INTO visual_chunks(video_id,idx,start,end,frame,objects,caption) VALUES(?,?,?,?,?,?,?)",
-            [(video_id, i, c["start"], c["end"], c["frame"],
-              json.dumps(c.get("objects", [])), c.get("caption", ""))
-             for i, c in enumerate(chunks)],
-        )
-        conn.commit()
+# --- X-CLIP action clips index ---
+def save_xclip_action_index(video_id: str, embeddings: np.ndarray):
+    _save_ip_index(XACLIP_PATH(video_id), embeddings)
+    _cache_put((video_id, "xaclip"), faiss.read_index(XACLIP_PATH(video_id)))
 
 
-def load_visual_index(video_id: str):
+def load_xclip_action_index(video_id: str):
     from db import db
-    key = (video_id, "vfaiss")
+    key = (video_id, "xaclip")
     index = _cache_get(key)
     if index is None:
-        index = faiss.read_index(VINDEX_PATH(video_id))
-        _cache_put(key, index)
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT idx,start,end,frame,objects,caption FROM visual_chunks WHERE video_id=? ORDER BY idx",
-            (video_id,),
-        ).fetchall()
-    return index, rows
-
-
-def save_action_clips_index(video_id: str, embeddings: np.ndarray, rows: list):
-    from db import db
-    _save_ip_index(ACLIP_PATH(video_id), embeddings)
-    with db() as conn:
-        conn.executemany(
-            "INSERT INTO visual_clips(video_id,idx,start,end,objects,caption) VALUES(?,?,?,?,?,?)",
-            [(video_id, i, r["start"], r["end"],
-              json.dumps(r.get("objects", [])), r.get("caption", ""))
-             for i, r in enumerate(rows)],
-        )
-        conn.commit()
-
-
-def load_action_clips_index(video_id: str):
-    from db import db
-    key = (video_id, "aclip")
-    index = _cache_get(key)
-    if index is None:
-        index = faiss.read_index(ACLIP_PATH(video_id))
+        index = faiss.read_index(XACLIP_PATH(video_id))
         _cache_put(key, index)
     with db() as conn:
         rows = conn.execute(
@@ -211,3 +165,9 @@ def load_action_clips_index(video_id: str):
             (video_id,),
         ).fetchall()
     return index, rows
+
+
+def has_xclip_action_index(video_id: str) -> bool:
+    return os.path.exists(XACLIP_PATH(video_id))
+
+

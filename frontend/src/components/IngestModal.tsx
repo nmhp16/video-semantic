@@ -16,7 +16,7 @@ interface IngestModalProps {
 const STAGES = [
   'Downloading & extracting frames…',
   'Transcribing audio…',
-  'Building context…',
+  'Building search index…',
 ]
 
 function stageIndex(stage: string): number {
@@ -104,7 +104,7 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
 
   return (
     <Dialog open={open} onOpenChange={handleClose} title="Add video"
-            description="Paste a YouTube URL to ingest and index.">
+            description="Paste a YouTube URL to download, transcribe, and index.">
       <div className="space-y-4">
         <div className="space-y-1.5">
           <label className="text-xxs font-medium uppercase tracking-wide text-subtle">
@@ -163,7 +163,7 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
             <div className="text-xs">
               <p className="font-medium text-emerald-400">Done</p>
               <p className="text-muted">
-                Video ID <span className="font-mono text-fg">{jobStatus?.video_id}</span>
+                Indexed as <span className="font-mono text-fg">{jobStatus?.video_id}</span>
               </p>
             </div>
           </div>
@@ -187,7 +187,7 @@ export function IngestModal({ open, onOpenChange, onSuccess }: IngestModalProps)
           ) : (
             <Button variant="primary" size="md" className="flex-1"
                     onClick={handleIngest} disabled={loading || !url.trim()}>
-              {loading ? 'Ingesting…' : 'Ingest'}
+              {loading ? 'Indexing…' : 'Index video'}
             </Button>
           )}
           <Button variant="secondary" size="md" onClick={() => handleClose(false)} disabled={loading}>

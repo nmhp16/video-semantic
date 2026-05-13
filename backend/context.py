@@ -8,11 +8,20 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 logger = logging.getLogger(__name__)
 
 _nlp = None
+_nlp_unavailable = False
+
 def _get_nlp():
-    global _nlp
+    global _nlp, _nlp_unavailable
+    if _nlp_unavailable:
+        return None
     if _nlp is None:
-        import spacy
-        _nlp = spacy.load("en_core_web_sm", disable=["ner"])
+        try:
+            import spacy
+            _nlp = spacy.load("en_core_web_sm", disable=["ner"])
+        except (OSError, ImportError):
+            logger.warning("spacy en_core_web_sm not found — run: python -m spacy download en_core_web_sm")
+            _nlp_unavailable = True
+            return None
     return _nlp
 
 
@@ -43,10 +52,12 @@ def top_objects_for(video_id: str, conn, k: int = 20) -> Dict[str, int]:
 
 
 def top_actions_for(video_id: str, conn, k: int = 20) -> Dict[str, int]:
+    nlp = _get_nlp()
+    if nlp is None:
+        return {}
     rows = conn.execute(
         "SELECT text FROM chunks WHERE video_id=?", (video_id,)
     ).fetchall()
-    nlp = _get_nlp()
     verb_counts: Counter = Counter()
     vo_counts: Counter = Counter()
     for (txt,) in rows:
@@ -215,15 +226,3 @@ def filter_videos_by_context(query: str, restrict_videos: Optional[List[str]] = 
     return [vid for vid, s in scored if s >= min_cos][:topn]
 
 
-def passes_hard_context(video_id: str, require_any: Optional[List[str]] = None,
-                         require_all: Optional[List[str]] = None) -> bool:
-    contexts = _fetch_contexts([video_id])
-    if not contexts:
-        return True
-    c = contexts[0]
-    bag = {w.lower() for w in [*c["topics"], *c["objects_topk"], *c["actions_topk"]]}
-    if require_all and not all(w.lower() in bag for w in require_all):
-        return False
-    if require_any and not any(w.lower() in bag for w in require_any):
-        return False
-    return True

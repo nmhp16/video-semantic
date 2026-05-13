@@ -1,24 +1,23 @@
-import os, json, subprocess
+import os, subprocess
 from typing import List, Dict
 from PIL import Image
 import numpy as np
 import torch
-from transformers import AutoProcessor, AutoModelForCausalLM, SiglipModel
+from transformers import AutoProcessor, AutoModelForCausalLM, AutoTokenizer
 from store import (
     DATA,
     save_visual_metadata, save_action_clips_metadata,
-    save_siglip_visual_index, save_siglip_action_clips_index,
+    save_siglip_visual_index, save_xclip_action_index,
 )
 from db import put_cached_captions
 import re
 from pathlib import Path
 from ingest import extract_audio
+from utils_unified import YT_ID_RE
 
 MEDIA = os.path.join(DATA, "media")
 FRAMES = os.path.join(DATA, "frames")
 os.makedirs(FRAMES, exist_ok=True)
-
-YT_ID_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 def _has_video_stream(path: str) -> bool:
     try:
@@ -32,7 +31,9 @@ def _has_video_stream(path: str) -> bool:
         return False
 
 def ytdlp_video(url: str, out_mp4: str):
-    if os.path.exists(out_mp4) and not _has_video_stream(out_mp4):
+    if os.path.exists(out_mp4) and _has_video_stream(out_mp4):
+        return  # already downloaded and valid
+    if os.path.exists(out_mp4):
         os.remove(out_mp4)
     from ingest import _ytdlp_auth_args
     subprocess.check_call([
@@ -127,144 +128,165 @@ def _caption_keywords(caption: str) -> List[str]:
     words = (w.lower() for w in _WORD_RE.findall(caption))
     return sorted({w for w in words if w not in _STOPWORDS})
 
-# --- Florence-2 captioning ---
-class Florence2Captioner:
-    def __init__(self, model_id: str = "microsoft/Florence-2-base"):
+# --- X-CLIP video-language encoder for action search ---
+class XCLIPEncoder:
+    N_FRAMES = 8
+
+    def __init__(self, model_id: str = "microsoft/xclip-base-patch32"):
+        from transformers import XCLIPProcessor, XCLIPModel
         if torch.cuda.is_available():
             self._device = "cuda"
         elif torch.backends.mps.is_available():
             self._device = "mps"
         else:
             self._device = "cpu"
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, trust_remote_code=True
-        ).to(self._device).eval()
+        self.processor = XCLIPProcessor.from_pretrained(model_id)
+        self.model = XCLIPModel.from_pretrained(model_id).to(self._device).eval()
 
-    def _run_task(self, image: Image.Image, task: str, max_new_tokens: int = 128) -> dict:
-        inputs = self.processor(text=task, images=image, return_tensors="pt").to(self._device)
+    def _uniform_sample(self, paths: List[str]) -> List[Image.Image]:
+        n = self.N_FRAMES
+        if len(paths) >= n:
+            idxs = np.linspace(0, len(paths) - 1, n, dtype=int)
+            selected = [paths[i] for i in idxs]
+        else:
+            reps = (n // len(paths)) + 1
+            selected = (paths * reps)[:n]
+        return [Image.open(p).convert("RGB") for p in selected]
+
+    def encode_clip_paths(self, paths: List[str]) -> np.ndarray:
+        frames = self._uniform_sample(paths)
+        try:
+            return self.encode_clip(frames)
+        finally:
+            for img in frames:
+                img.close()
+
+    def encode_clip(self, pil_frames: List[Image.Image]) -> np.ndarray:
+        inputs = self.processor(videos=[pil_frames], return_tensors="pt").to(self._device)
         with torch.no_grad():
-            gen = self.model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=max_new_tokens,
-                num_beams=1,
-                do_sample=False,
-            )
-        text = self.processor.batch_decode(gen, skip_special_tokens=False)[0]
-        return self.processor.post_process_generation(text, task=task, image_size=image.size)
-
-    def process_image(self, image: Image.Image) -> Dict:
-        """Return a detailed caption and caption-derived object keywords."""
-        cap_result = self._run_task(image, "<MORE_DETAILED_CAPTION>", max_new_tokens=128)
-        caption = cap_result.get("<MORE_DETAILED_CAPTION>", "")
-        objects = _caption_keywords(caption)
-        return {"caption": caption, "objects": objects}
-
-    def process_images(self, pil_images: List[Image.Image]) -> List[Dict]:
-        """Process a batch of images sequentially."""
-        results = []
-        for i, img in enumerate(pil_images):
-            results.append(self.process_image(img))
-            if (i + 1) % 10 == 0:
-                print(f"  captioned {i+1}/{len(pil_images)} frames")
-        return results
-
-
-# --- SigLIP vision-text encoder (for direct frame embedding) ---
-class SigLIPEncoder:
-    def __init__(self, model_id: str = "google/siglip-base-patch16-224"):
-        if torch.cuda.is_available():
-            self._device = "cuda"
-        elif torch.backends.mps.is_available():
-            self._device = "mps"
-        else:
-            self._device = "cpu"
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = SiglipModel.from_pretrained(model_id).to(self._device).eval()
-
-    def encode_images(self, pil_images: List[Image.Image], batch_size: int = 16) -> np.ndarray:
-        all_embs = []
-        for i in range(0, len(pil_images), batch_size):
-            batch = pil_images[i:i + batch_size]
-            inputs = self.processor(images=batch, return_tensors="pt").to(self._device)
-            with torch.no_grad():
-                feats = self.model.get_image_features(**inputs)
-            feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            all_embs.append(feats.float().cpu().numpy())
-            if (i + batch_size) % 64 == 0 or i + batch_size >= len(pil_images):
-                print(f"  siglip {min(i + batch_size, len(pil_images))}/{len(pil_images)} frames")
-        return np.concatenate(all_embs, axis=0).astype("float32")
-
-    def encode_image_paths(self, paths: List[str], batch_size: int = 16) -> np.ndarray:
-        """Encode frames by path, opening only `batch_size` images at a time.
-        Avoids holding every PIL image in memory simultaneously."""
-        all_embs = []
-        total = len(paths)
-        for i in range(0, total, batch_size):
-            batch_paths = paths[i:i + batch_size]
-            batch = [Image.open(p).convert("RGB") for p in batch_paths]
-            try:
-                inputs = self.processor(images=batch, return_tensors="pt").to(self._device)
-                with torch.no_grad():
-                    feats = self.model.get_image_features(**inputs)
-                feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                all_embs.append(feats.float().cpu().numpy())
-            finally:
-                for img in batch:
-                    img.close()
-            if (i + batch_size) % 64 == 0 or i + batch_size >= total:
-                print(f"  siglip {min(i + batch_size, total)}/{total} frames")
-        return np.concatenate(all_embs, axis=0).astype("float32")
+            feats = self.model.get_video_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        return feats.float().cpu().numpy()[0]
 
     def encode_text(self, texts: List[str]) -> np.ndarray:
-        inputs = self.processor(
-            text=texts, return_tensors="pt", padding="max_length", truncation=True
-        ).to(self._device)
+        inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self._device)
         with torch.no_grad():
             feats = self.model.get_text_features(**inputs)
         feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         return feats.float().cpu().numpy().astype("float32")
 
+    def encode_frames_batch(self, paths: List[str], batch_size: int = 8) -> np.ndarray:
+        """Encode individual frames by treating each as a duplicated 8-frame clip."""
+        total = len(paths)
+        results = []
+        for i in range(0, total, batch_size):
+            batch_paths = paths[i:i + batch_size]
+            batch_imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+            try:
+                videos = [[img] * self.N_FRAMES for img in batch_imgs]
+                inputs = self.processor(videos=videos, return_tensors="pt").to(self._device)
+                with torch.no_grad():
+                    feats = self.model.get_video_features(**inputs)
+                feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                results.append(feats.float().cpu().numpy())
+            finally:
+                for img in batch_imgs:
+                    img.close()
+            print(f"  xclip frames {min(i + batch_size, total)}/{total}")
+        return np.concatenate(results, axis=0).astype("float32")
 
-# --- Build sliding-window action clips from caption embeddings ---
-def build_caption_windows(frames, embs, captions_data, clip_len=2.0, stride=0.5):
-    """Build sliding windows using caption embeddings (bge-small space)."""
-    i, N = 0, len(frames)
-    clip_vecs, rows = [], []
-    while i < N:
-        t0 = frames[i]["t"]
-        idxs = []
-        j = i
-        while j < N and frames[j]["t"] <= t0 + clip_len:
-            idxs.append(j)
-            j += 1
-        if idxs:
-            V = embs[idxs]
-            v = V.mean(axis=0)
-            v /= (np.linalg.norm(v) + 1e-12)
 
-            objs = set()
-            for k in idxs:
-                for o in captions_data[k]["objects"]:
-                    objs.add(o)
+def build_xclip_clips(frames, xclip: XCLIPEncoder,
+                      captions_data=None, clip_len: float = 4.0, stride: float = 2.0):
+    """Sliding-window action clips encoded with X-CLIP video tower."""
+    if not frames:
+        return np.zeros((0, 512), dtype="float32"), []
 
-            # Use middle frame's caption as representative
-            mid_idx = idxs[len(idxs) // 2]
-            caption = captions_data[mid_idx]["caption"]
+    frame_to_idx = {f["path"]: i for i, f in enumerate(frames)}
+    clip_vecs, clip_rows = [], []
+    duration = frames[-1]["t_end"]
+    t = frames[0]["t"]
 
-            clip_vecs.append(v)
-            rows.append({
-                "start": float(frames[idxs[0]]["t"]),
-                "end":   float(frames[idxs[-1]]["t_end"]),
-                "objects": sorted(list(objs)),
-                "caption": caption,
-            })
-        # Stride
-        t_next = t0 + stride
-        while i < N and frames[i]["t"] < t_next:
-            i += 1
-    return np.stack(clip_vecs, axis=0).astype("float32"), rows
+    while t < duration:
+        t_end = min(t + clip_len, duration)
+        window = [f for f in frames if t <= f["t"] < t_end]
+        if not window:
+            t += stride
+            continue
+
+        emb = xclip.encode_clip_paths([f["path"] for f in window])
+        clip_vecs.append(emb)
+
+        mid = window[len(window) // 2]
+        idx = frame_to_idx.get(mid["path"])
+        caption = captions_data[idx]["caption"] if (captions_data and idx is not None) else ""
+        objects = captions_data[idx]["objects"] if (captions_data and idx is not None) else []
+
+        clip_rows.append({
+            "start": float(window[0]["t"]),
+            "end": float(min(window[-1]["t_end"], t_end)),
+            "objects": objects,
+            "caption": caption,
+        })
+        t += stride
+
+    if not clip_vecs:
+        return np.zeros((0, 512), dtype="float32"), []
+    return np.stack(clip_vecs).astype("float32"), clip_rows
+
+
+# --- Moondream2 captioning (default) ---
+class Moondream2Captioner:
+    _REVISION = "2025-01-09"
+
+    def __init__(self, model_id: str = "vikhyatk/moondream2"):
+        if torch.cuda.is_available():
+            self._device = "cuda"
+            dtype = torch.float16
+        elif torch.backends.mps.is_available():
+            self._device = "mps"
+            dtype = torch.float16
+        else:
+            self._device = "cpu"
+            dtype = torch.float32
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, revision=self._REVISION)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            revision=self._REVISION,
+            torch_dtype=dtype,
+        ).to(self._device).eval()
+
+    def process_image(self, image: Image.Image) -> Dict:
+        enc = self.model.encode_image(image)
+        caption = self.model.answer_question(
+            enc, "Describe what you see in this image in detail.", self.tokenizer
+        )
+        return {"caption": caption, "objects": _caption_keywords(caption)}
+
+    @staticmethod
+    def _resize_for_caption(img: Image.Image, max_side: int = 512) -> Image.Image:
+        w, h = img.size
+        if max(w, h) <= max_side:
+            return img
+        scale = max_side / max(w, h)
+        return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    def process_images(self, pil_images: List[Image.Image]) -> List[Dict]:
+        n = len(pil_images)
+        results = []
+        for i, img in enumerate(pil_images):
+            enc = self.model.encode_image(self._resize_for_caption(img))
+            caption = self.model.answer_question(
+                enc, "Describe what you see in this image in detail.", self.tokenizer
+            )
+            del enc
+            results.append({"caption": caption, "objects": _caption_keywords(caption)})
+            if (i + 1) % 5 == 0 or i + 1 == n:
+                print(f"  captioned {i+1}/{n} frames")
+        return results
+
+
 
 
 def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: float = 0.3):
@@ -300,33 +322,40 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: floa
     out_dir = os.path.join(FRAMES, video_id)
     frames = sample_frames(src, out_dir, max_gap_sec=max_gap_sec, scene_thresh=scene_thresh)
 
-    # SigLIP frame embeddings (direct vision-text contrastive space — no captioning).
-    # Encode in batches directly from disk so we never hold every frame in RAM.
-    print(f"SigLIP-encoding {len(frames)} frames...")
-    siglip = SigLIPEncoder("google/siglip-base-patch16-224")
-    siglip_embs = siglip.encode_image_paths([f["path"] for f in frames], batch_size=16)
+    # X-CLIP frame embeddings (visual search)
+    xclip = XCLIPEncoder()
+    print(f"X-CLIP encoding {len(frames)} frames...")
+    frame_embs = xclip.encode_frames_batch([f["path"] for f in frames], batch_size=8)
 
-    # Florence-2 captions generated now so search queries return immediately.
-    print(f"Florence-2 captioning {len(frames)} frames...")
-    captioner = Florence2Captioner("microsoft/Florence-2-base")
-    captions_data = []
-    for i, f in enumerate(frames):
-        img = Image.open(f["path"]).convert("RGB")
-        captions_data.append(captioner.process_image(img))
-        if (i + 1) % 10 == 0:
-            print(f"  captioned {i+1}/{len(frames)} frames")
+    # Free X-CLIP from GPU before loading Moondream2 — both use MPS and would OOM together
+    del xclip
+    import gc; gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # Moondream2 captions (encode+caption one frame at a time to avoid accumulating KV caches)
+    print(f"Moondream2 captioning {len(frames)} frames...")
+    captioner = Moondream2Captioner()
+    pil_images = [Image.open(f["path"]).convert("RGB") for f in frames]
+    captions_data = captioner.process_images(pil_images)
+    del pil_images, captioner
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     frame_rel = [os.path.relpath(f["path"], start=os.path.dirname(DATA)) for f in frames]
     put_cached_captions(video_id, {k: v for k, v in zip(frame_rel, captions_data)})
     print(f"Cached {len(captions_data)} captions for {video_id}")
 
-    # Action clips: sliding windows over SigLIP frame embeddings
-    siglip_clip_vecs, clip_rows = build_caption_windows(
-        frames, siglip_embs, captions_data, clip_len=2.0, stride=0.5
+    # Action clips: X-CLIP sliding windows (reload X-CLIP with free GPU memory)
+    xclip = XCLIPEncoder()
+    print(f"X-CLIP encoding action clips for {video_id}...")
+    xclip_clip_vecs, clip_rows = build_xclip_clips(
+        frames, xclip, captions_data=captions_data, clip_len=4.0, stride=2.0
     )
-    save_siglip_action_clips_index(video_id, siglip_clip_vecs)
+    save_xclip_action_index(video_id, xclip_clip_vecs)
     save_action_clips_metadata(video_id, clip_rows)
-    print(f"ACTION CLIPS OK: {video_id} | clips={len(siglip_clip_vecs)}")
+    print(f"ACTION CLIPS OK: {video_id} | clips={len(xclip_clip_vecs)}")
 
     rows = []
     for i, f in enumerate(frames):
@@ -338,7 +367,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 5.0, scene_thresh: floa
             "caption": captions_data[i]["caption"],
         })
 
-    save_siglip_visual_index(video_id, siglip_embs)
+    save_siglip_visual_index(video_id, frame_embs)
     save_visual_metadata(video_id, rows)
     print(f"INGEST OK: {video_id} | frames={len(frames)}")
 

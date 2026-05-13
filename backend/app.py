@@ -40,3 +40,13 @@ app.include_router(videos.router)
 @app.on_event("startup")
 async def startup():
     init_db()
+    import threading
+    def _warm_models():
+        try:
+            logging.getLogger(__name__).info("Pre-warming models…")
+            from routers.search import _get_xclip
+            _get_xclip()
+            logging.getLogger(__name__).info("X-CLIP ready")
+        except Exception:
+            logging.getLogger(__name__).exception("Model pre-warm failed")
+    threading.Thread(target=_warm_models, daemon=True).start()

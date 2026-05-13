@@ -41,9 +41,10 @@ async def list_videos():
             if not filename.endswith(".mp4"):
                 continue
             vid = filename[:-4]
-            has_text   = os.path.exists(os.path.join(_indexes_dir, f"{vid}.faiss"))
-            has_visual = os.path.exists(os.path.join(_indexes_dir, f"{vid}.svfaiss"))
-            has_action = os.path.exists(os.path.join(_indexes_dir, f"{vid}.saclip.faiss"))
+            has_text      = os.path.exists(os.path.join(_indexes_dir, f"{vid}.faiss"))
+            has_visual    = os.path.exists(os.path.join(_indexes_dir, f"{vid}.svfaiss"))
+            has_xclip     = os.path.exists(os.path.join(_indexes_dir, f"{vid}.xaclip.faiss"))
+            has_action    = has_xclip or os.path.exists(os.path.join(_indexes_dir, f"{vid}.saclip.faiss"))
             # Fetch title, source_url, top_objects from video_context
             title, source_url, top_objects = None, None, []
             with db() as conn:
@@ -65,6 +66,7 @@ async def list_videos():
                 "has_text_search": has_text,
                 "has_visual_search": has_visual,
                 "has_action_search": has_action,
+                "has_xclip_action": has_xclip,
                 "thumbnail_url": _thumbnail_url_for(vid),
                 "top_objects": top_objects,
             })
@@ -86,7 +88,7 @@ def delete_video(video_id: str = Path(..., pattern=_VIDEO_ID_RE)):
 
 @router.post("/ov_verify")
 def ov_verify(req: OVVerifyRequest):
-    from gdino import detect_on_image
+    from detection import detect_on_image
     out = {}
     for f in req.frames:
         try:

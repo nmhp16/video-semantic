@@ -8,6 +8,7 @@ export interface VideoMeta {
   has_text_search: boolean
   has_visual_search: boolean
   has_action_search: boolean
+  has_xclip_action: boolean
   thumbnail_url?: string | null
   top_objects: string[]
 }
@@ -16,6 +17,7 @@ export interface ScoreRange {
   min: number
   max: number
 }
+
 
 export interface UnifiedSearchHit {
   start: number
@@ -30,9 +32,8 @@ export interface UnifiedSearchHit {
 
 export interface UnifiedSearchResponse {
   video_id: string | null
-  mode: 'text' | 'visual' | 'action' | 'action_chain'
+  mode: 'text' | 'visual' | 'action'
   hits: UnifiedSearchHit[]
-  info: Record<string, unknown>
   score_range: ScoreRange | null
 }
 
@@ -58,7 +59,7 @@ export interface IngestResponse {
   status: 'completed' | 'already_exists'
 }
 
-export type SearchMode = 'text' | 'visual' | 'action' | 'action_chain'
+export type SearchMode = 'text' | 'visual' | 'action'
 export type SearchScope = 'video' | 'global'
 
 export interface UnifiedSearchRequest {
@@ -68,8 +69,6 @@ export interface UnifiedSearchRequest {
   mode: SearchMode
   k?: number
   filter_objects?: string
-  steps?: string[]
-  max_gap?: number
   ingest_if_needed?: boolean
   scope?: SearchScope
   videos?: string[]

@@ -52,10 +52,6 @@ export function Layout({ children }: LayoutProps) {
 
           <div className="flex-1" />
 
-          {/* Right side meta */}
-          <div className="hidden sm:flex items-center gap-2 text-xxs text-subtle">
-            <span>SigLIP ↔ Whisper ↔ Florence-2</span>
-          </div>
         </div>
       </header>
 

@@ -20,7 +20,7 @@ class VideoIngestRequest(BaseModel):
     video_url: str
     video_id: Optional[str] = None  # If not provided, will be extracted from URL
 
-MODE = Literal["text", "visual", "action", "action_chain"]
+MODE = Literal["text", "visual", "action"]
 
 # Keep search fan-out bounded so a single client can't request thousands
 # of hits (every hit may trigger lazy Florence-2 captioning).
@@ -33,18 +33,9 @@ class UnifiedSearchRequest(BaseModel):
     mode: MODE
     k: int = Field(default=50, ge=1, le=MAX_K)
     filter_objects: Optional[str] = None
-    # Action chain params
-    steps: Optional[List[str]] = None
-    max_gap: float = Field(default=8.0, ge=0.0, le=60.0)
     ingest_if_needed: bool = True
     scope: str = "video"
     videos: Optional[List[str]] = None
-    verify_with_gdino: bool = False
-    verify_prompts: Optional[List[str]] = None
-    verify_require_all: Optional[List[str]] = None
-    verify_box_threshold: float = 0.3
-    verify_text_threshold: float = 0.35
-    verify_topk: int = Field(default=30, ge=1, le=MAX_K)
 
 class UnifiedSearchHit(BaseModel):
     start: float
@@ -53,14 +44,14 @@ class UnifiedSearchHit(BaseModel):
     text: Optional[str] = None                 # for text mode
     frame: Optional[str] = None                # for visual mode
     objects: Optional[List[str]] = None        # visual/action modes
-    caption: Optional[str] = None              # visual/action caption from Florence-2
+    caption: Optional[str] = None
     video_id: str
 
 class UnifiedSearchResponse(BaseModel):
     video_id: Optional[str] = None
     mode: MODE
     hits: List[UnifiedSearchHit] = Field(default_factory=list)
-    info: dict = Field(default_factory=dict)   # extra info (e.g., chosen path for action_chain)
+    info: dict = Field(default_factory=dict)
     score_range: Optional["ScoreRange"] = None
 
 class OVVerifyRequest(BaseModel):
@@ -72,6 +63,7 @@ class OVVerifyRequest(BaseModel):
 class ScoreRange(BaseModel):
     min: float
     max: float
+
 
 class IngestJobResponse(BaseModel):
     job_id: Optional[str]

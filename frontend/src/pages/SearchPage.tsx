@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Plus, Search, X } from 'lucide-react'
+import { Plus, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { FilterPanel } from '@/components/FilterPanel'
 import { IngestModal } from '@/components/IngestModal'
@@ -13,71 +12,14 @@ import type {
   SearchScope,
   UnifiedSearchHit,
   VideoMeta,
+  ScoreRange,
 } from '@/lib/api'
 import { useSearchHistory } from '@/hooks/useSearchHistory'
-import type { ScoreRange } from '@/lib/api'
-
-function ChainStepsInput({
-  steps,
-  onChange,
-}: {
-  steps: string[]
-  onChange: (steps: string[]) => void
-}) {
-  const addStep = () => onChange([...steps, ''])
-  const updateStep = (i: number, val: string) => {
-    const next = [...steps]
-    next[i] = val
-    onChange(next)
-  }
-  const removeStep = (i: number) => {
-    const next = steps.filter((_, idx) => idx !== i)
-    onChange(next.length ? next : [''])
-  }
-
-  return (
-    <div className="rounded-lg border border-border bg-surface/40 p-3 space-y-2">
-      <p className="text-xxs font-medium uppercase tracking-wide text-subtle">
-        Action sequence
-      </p>
-      {steps.map((step, i) => (
-        <div key={i} className="flex items-center gap-2">
-          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-sm bg-surface2 font-mono text-xxs text-muted">
-            {i + 1}
-          </span>
-          <Input
-            placeholder={`Step ${i + 1}`}
-            value={step}
-            onChange={(e) => updateStep(i, e.target.value)}
-            className="h-8 text-sm"
-          />
-          {steps.length > 1 && (
-            <button
-              onClick={() => removeStep(i)}
-              className="flex-shrink-0 rounded-md p-1 text-subtle hover:text-red-400 hover:bg-surface2 transition-colors"
-              aria-label="Remove step"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
-      ))}
-      <button
-        onClick={addStep}
-        className="inline-flex items-center gap-1 text-xs text-muted hover:text-fg transition-colors"
-      >
-        <Plus className="h-3 w-3" />
-        Add step
-      </button>
-    </div>
-  )
-}
 
 const PLACEHOLDERS: Record<SearchMode, string> = {
   text: 'Search transcripts…',
   visual: 'Describe a scene or object…',
   action: 'Describe an action or activity…',
-  action_chain: 'Describe each step in order…',
 }
 
 export function SearchPage() {
@@ -86,7 +28,6 @@ export function SearchPage() {
   const [scope, setScope] = useState<SearchScope>('video')
   const [selectedVideo, setSelectedVideo] = useState('')
   const [filterObjects, setFilterObjects] = useState('')
-  const [chainSteps, setChainSteps] = useState([''])
   const [videos, setVideos] = useState<VideoMeta[]>([])
   const [hits, setHits] = useState<UnifiedSearchHit[]>([])
   const [loading, setLoading] = useState(false)
@@ -137,12 +78,8 @@ export function SearchPage() {
   }, [])
 
   const handleSearch = useCallback(async () => {
-    const isChain = mode === 'action_chain'
-    const effectiveQuery = isChain ? undefined : query.trim()
-    const effectiveSteps = isChain ? chainSteps.filter(Boolean) : undefined
-
-    if (!isChain && !effectiveQuery) return
-    if (isChain && (!effectiveSteps || effectiveSteps.length === 0)) return
+    const q = query.trim()
+    if (!q) return
     if (scope === 'video' && !selectedVideo) return
 
     setLoading(true)
@@ -151,27 +88,25 @@ export function SearchPage() {
 
     try {
       const res = await api.query({
-        query: effectiveQuery,
+        query: q,
         mode,
         scope,
         video_id: scope === 'video' ? selectedVideo : undefined,
         filter_objects: filterObjects.trim() || undefined,
-        steps: effectiveSteps,
         k: 24,
         ingest_if_needed: false,
       })
       setHits(res.hits)
       setScoreRange(res.score_range ?? null)
-      if (!isChain && effectiveQuery) {
-        pushHistory(effectiveQuery, mode)
-      }
+      pushHistory(q, mode)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed')
       setHits([])
     } finally {
       setLoading(false)
     }
-  }, [query, mode, scope, selectedVideo, filterObjects, chainSteps, pushHistory])
+  }, [query, mode, scope, selectedVideo, filterObjects, pushHistory])
+
 
   const handleModeChange = (m: SearchMode) => {
     setMode(m)
@@ -204,74 +139,57 @@ export function SearchPage() {
 
       {/* Search input area */}
       <div className="space-y-3">
-        {mode !== 'action_chain' ? (
-          <>
-            <div className="flex gap-2">
-              <div className="relative flex-1">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-subtle pointer-events-none" />
-                <input
-                  ref={inputRef}
-                  className="w-full h-11 pl-10 pr-20 rounded-lg border border-border bg-surface text-sm text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
-                  placeholder={PLACEHOLDERS[mode]}
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                  onFocus={() => setInputFocused(true)}
-                  onBlur={() => setTimeout(() => setInputFocused(false), 150)}
-                />
-                <span className="absolute right-3 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 pointer-events-none">
-                  <span className="kbd">⌘</span>
-                  <span className="kbd">K</span>
-                </span>
-              </div>
-              <Button
-                variant="primary"
-                size="lg"
-                onClick={handleSearch}
-                disabled={loading || !query.trim()}
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-subtle pointer-events-none" />
+            <input
+              ref={inputRef}
+              className="w-full h-11 pl-10 pr-20 rounded-lg border border-border bg-surface text-sm text-fg placeholder:text-dim hover:border-border-strong focus:outline-none focus:border-accent/50 focus:ring-2 focus:ring-accent-ring transition-colors"
+              placeholder={PLACEHOLDERS[mode]}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setTimeout(() => setInputFocused(false), 150)}
+            />
+            <span className="absolute right-3 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 pointer-events-none">
+              <span className="kbd">⌘</span>
+              <span className="kbd">K</span>
+            </span>
+          </div>
+          <Button
+            variant="primary"
+            size="lg"
+            onClick={handleSearch}
+            disabled={loading || !query.trim()}
+          >
+            {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
+            Search
+          </Button>
+        </div>
+        {inputFocused && history.length > 0 && !query && (
+          <div className="flex flex-wrap gap-1.5">
+            {history.map((entry) => (
+              <button
+                key={`${entry.query}-${entry.mode}`}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  setQuery(entry.query)
+                  setMode(entry.mode)
+                  setTimeout(() => handleSearch(), 0)
+                }}
+                className="group inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-xs text-muted hover:border-border-strong hover:text-fg transition-colors"
               >
-                {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
-                Search
-              </Button>
-            </div>
-            {inputFocused && history.length > 0 && !query && (
-              <div className="flex flex-wrap gap-1.5">
-                {history.map((entry) => (
-                  <button
-                    key={`${entry.query}-${entry.mode}`}
-                    onMouseDown={(e) => {
-                      e.preventDefault()
-                      setQuery(entry.query)
-                      setMode(entry.mode)
-                      setTimeout(() => handleSearch(), 0)
-                    }}
-                    className="group inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-xs text-muted hover:border-border-strong hover:text-fg transition-colors"
-                  >
-                    <span>{entry.query}</span>
-                    <span className="text-[10px] text-dim">{entry.mode}</span>
-                    <span
-                      onMouseDown={(e) => { e.stopPropagation(); removeHistory(entry.query, entry.mode) }}
-                      className="ml-0.5 text-dim hover:text-red-400 cursor-pointer"
-                    >
-                      ×
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
-        ) : (
-          <div className="space-y-3">
-            <ChainStepsInput steps={chainSteps} onChange={setChainSteps} />
-            <Button
-              variant="primary"
-              size="md"
-              onClick={handleSearch}
-              disabled={loading || chainSteps.filter(Boolean).length === 0}
-            >
-              {loading ? <Spinner size="sm" className="text-white" /> : <Search className="h-4 w-4" />}
-              Find sequence
-            </Button>
+                <span>{entry.query}</span>
+                <span className="text-[10px] text-dim">{entry.mode}</span>
+                <span
+                  onMouseDown={(e) => { e.stopPropagation(); removeHistory(entry.query, entry.mode) }}
+                  className="ml-0.5 text-dim hover:text-red-400 cursor-pointer"
+                >
+                  ×
+                </span>
+              </button>
+            ))}
           </div>
         )}
 
@@ -299,9 +217,7 @@ export function SearchPage() {
         {loading && (
           <div className="flex flex-col items-center justify-center py-24 gap-3">
             <Spinner size="lg" className="text-accent" />
-            <p className="text-xs text-muted">
-              {mode === 'action_chain' ? 'Solving sequence…' : 'Searching…'}
-            </p>
+            <p className="text-xs text-muted">Searching…</p>
           </div>
         )}
 

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ExternalLink, RefreshCw, Trash2 } from 'lucide-react'
+import { ExternalLink, Film, RefreshCw, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Spinner } from '@/components/ui/spinner'
 import { cn, isYouTubeId, youtubeUrl } from '@/lib/utils'
@@ -11,7 +11,7 @@ interface VideoLibraryProps {
   loading: boolean
   onSelect?: (videoId: string) => void
   onDeleted?: (videoId: string) => void
-  onReindex?: (videoId: string) => void
+  onReindexed?: () => void
 }
 
 function StatusDot({ active, label }: { active: boolean; label: string }) {
@@ -51,10 +51,14 @@ function Thumbnail({ video }: { video: VideoMeta }) {
       />
     )
   }
-  return <div className="h-10 w-16 rounded-sm bg-surface2 border border-border" />
+  return (
+    <div className="h-10 w-16 rounded-sm bg-surface2 border border-border flex items-center justify-center">
+      <Film className="h-4 w-4 text-dim" />
+    </div>
+  )
 }
 
-export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibraryProps) {
+export function VideoLibrary({ videos, loading, onSelect, onDeleted, onReindexed }: VideoLibraryProps) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
@@ -78,6 +82,7 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
     setReindexing(videoId)
     try {
       await api.buildContexts([videoId])
+      onReindexed?.()
     } finally {
       setReindexing(null)
     }
@@ -180,7 +185,15 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
                   <div className="flex items-center gap-4">
                     <StatusDot active={v.has_text_search} label="Text" />
                     <StatusDot active={v.has_visual_search} label="Visual" />
-                    <StatusDot active={v.has_action_search} label="Action" />
+                    <span className="inline-flex items-center gap-1.5">
+                      <StatusDot active={v.has_action_search} label="Action" />
+                      {v.has_xclip_action && (
+                        <Badge variant="neutral" className="text-[9px] px-1 py-0 leading-tight" title="Temporal action search — understands motion between frames">X-CLIP</Badge>
+                      )}
+                      {v.has_action_search && !v.has_xclip_action && (
+                        <Badge variant="outline" className="text-[9px] px-1 py-0 leading-tight text-dim" title="Older action index — re-ingest to upgrade">legacy</Badge>
+                      )}
+                    </span>
                   </div>
                 </td>
                 <td className="px-4 py-3">
@@ -193,7 +206,7 @@ export function VideoLibrary({ videos, loading, onSelect, onDeleted }: VideoLibr
                     <button
                       onClick={(e) => { e.stopPropagation(); handleReindex(v.video_id) }}
                       disabled={reindexing === v.video_id}
-                      title="Rebuild context index"
+                      title="Rebuild search index"
                       className="rounded-md p-1 text-subtle hover:text-fg hover:bg-surface2 transition-colors disabled:opacity-40"
                     >
                       {reindexing === v.video_id

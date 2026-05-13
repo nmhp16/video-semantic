@@ -1,11 +1,11 @@
 # backend/routers/ingest.py
-import os, re, uuid, time, logging
+import os, uuid, time, logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, List
-from urllib.parse import urlparse, parse_qs
 from fastapi import APIRouter, HTTPException
 from models import VideoIngestRequest
+from utils_unified import extract_video_id as _parse_video_id
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -34,6 +34,14 @@ def _set(job_id: str, stage: str, status: str = "running"):
         _jobs[job_id].stage = stage
 
 
+def _sweep_jobs():
+    now = time.monotonic()
+    stale = [jid for jid, j in _jobs.items()
+             if j.status in ("done", "error") and (now - j.created_at) > _JOB_TTL]
+    for jid in stale:
+        del _jobs[jid]
+
+
 def _run_ingest(job_id: str, url: str, video_id: str):
     try:
         _set(job_id, "Downloading & extracting frames…")
@@ -55,7 +63,7 @@ def _run_ingest(job_id: str, url: str, video_id: str):
         from ingest import ingest as do_ingest
         do_ingest(url)
 
-        _set(job_id, "Building context…")
+        _set(job_id, "Building search index…")
         from context import build_video_context
         build_video_context(video_id)
 
@@ -71,32 +79,20 @@ def _run_ingest(job_id: str, url: str, video_id: str):
         _jobs[job_id].error = str(e)
 
 
-def _extract_video_id(video_url: str, override: Optional[str]) -> str:
-    if override:
-        return override
-    if "youtube.com" in video_url or "youtu.be" in video_url:
-        if "youtu.be/" in video_url:
-            vid = video_url.split("youtu.be/")[-1].split("?")[0]
-        else:
-            parsed = urlparse(video_url)
-            vid = parse_qs(parsed.query).get("v", [None])[0]
-        if not vid:
-            raise ValueError("Could not extract video ID from YouTube URL")
-        return vid
-    return re.sub(r"[^a-zA-Z0-9_-]", "", video_url.split("/")[-1])[:11]
-
-
 @router.post("/ingest")
 async def ingest_video(request: VideoIngestRequest):
-    try:
-        video_id = _extract_video_id(request.video_url, request.video_id)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    _sweep_jobs()
+    video_id = request.video_id or _parse_video_id(request.video_url)
 
-    media_path = os.path.join(_media_dir, f"{video_id}.mp4")
-    if os.path.exists(media_path):
+    _indexes_dir = os.path.join(BASE, "data", "indexes")
+    fully_indexed = (
+        os.path.exists(os.path.join(_indexes_dir, f"{video_id}.faiss")) and
+        os.path.exists(os.path.join(_indexes_dir, f"{video_id}.svfaiss")) and
+        os.path.exists(os.path.join(_indexes_dir, f"{video_id}.xaclip.faiss"))
+    )
+    if fully_indexed:
         return {"job_id": None, "video_id": video_id,
-                "status": "already_exists", "message": f"Video {video_id} already exists"}
+                "status": "already_exists", "message": f"Video {video_id} already indexed"}
 
     job_id = str(uuid.uuid4())
     _jobs[job_id] = _JobState(job_id=job_id, video_id=video_id,
