@@ -1,6 +1,5 @@
 # backend/routers/ingest.py
-import os, uuid, time, logging
-from concurrent.futures import ThreadPoolExecutor
+import os, uuid, time, logging, json, multiprocessing
 from dataclasses import dataclass, field
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException
@@ -11,41 +10,41 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 BASE = os.path.dirname(os.path.dirname(__file__))
-_media_dir = os.path.join(BASE, "data", "media")
+_JOBS_DIR = os.path.join(BASE, "data", "jobs")
+os.makedirs(_JOBS_DIR, exist_ok=True)
 
-_executor = ThreadPoolExecutor(max_workers=1)
-_jobs: dict[str, "_JobState"] = {}
-_JOB_TTL = 600  # seconds to keep terminal jobs
+_jobs: dict[str, "_JobHandle"] = {}
+_JOB_TTL = 3600  # 1 hour — ingest can be slow
 
 
 @dataclass
-class _JobState:
+class _JobHandle:
     job_id: str
     video_id: str
-    status: str        # queued | running | done | error
-    stage: str
-    error: Optional[str] = None
+    status_file: str
     created_at: float = field(default_factory=time.monotonic)
 
-
-def _set(job_id: str, stage: str, status: str = "running"):
-    if job_id in _jobs:
-        _jobs[job_id].status = status
-        _jobs[job_id].stage = stage
-
-
-def _sweep_jobs():
-    now = time.monotonic()
-    stale = [jid for jid, j in _jobs.items()
-             if j.status in ("done", "error") and (now - j.created_at) > _JOB_TTL]
-    for jid in stale:
-        del _jobs[jid]
+    def read(self) -> dict:
+        try:
+            with open(self.status_file) as f:
+                return json.load(f)
+        except Exception:
+            return {"status": "running", "stage": "Starting…", "error": None}
 
 
-def _run_ingest(job_id: str, url: str, video_id: str):
+def _write_status(path: str, status: str, stage: str, error: Optional[str] = None):
+    with open(path, "w") as f:
+        json.dump({"status": status, "stage": stage, "error": error}, f)
+
+
+def _run_ingest_proc(status_file: str, url: str, video_id: str):
+    import sys, os as _os
+    _backend = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _backend not in sys.path:
+        sys.path.insert(0, _backend)
+
     try:
-        _set(job_id, "Downloading & extracting frames…")
-        # Fetch title before downloading (no-download metadata call)
+        _write_status(status_file, "running", "Fetching metadata…")
         title, source_url = None, None
         try:
             import yt_dlp
@@ -54,16 +53,17 @@ def _run_ingest(job_id: str, url: str, video_id: str):
                 title = info.get("title")
                 source_url = info.get("webpage_url") or url
         except Exception:
-            logger.warning("Could not fetch yt-dlp metadata for %s", url)
+            pass
 
-        from visual_ingest import ingest_visual as do_visual
-        do_visual(url)
+        _write_status(status_file, "running", "Downloading & extracting frames…")
+        from visual_ingest import ingest_visual
+        ingest_visual(url)
 
-        _set(job_id, "Transcribing audio…")
-        from ingest import ingest as do_ingest
-        do_ingest(url)
+        _write_status(status_file, "running", "Transcribing audio…")
+        from ingest import ingest
+        ingest(url)
 
-        _set(job_id, "Building search index…")
+        _write_status(status_file, "running", "Building search index…")
         from context import build_video_context
         build_video_context(video_id)
 
@@ -71,12 +71,22 @@ def _run_ingest(job_id: str, url: str, video_id: str):
             from db import store_video_meta
             store_video_meta(video_id, title, source_url)
 
-        _jobs[job_id].status = "done"
-        _jobs[job_id].stage = "Done"
+        _write_status(status_file, "done", "Done")
     except Exception as e:
-        logger.exception("Ingest failed for %s", video_id)
-        _jobs[job_id].status = "error"
-        _jobs[job_id].error = str(e)
+        import traceback
+        _write_status(status_file, "error", "Failed", error=traceback.format_exc()[-2000:])
+
+
+def _sweep_jobs():
+    now = time.monotonic()
+    stale = [jid for jid, h in list(_jobs.items())
+             if (now - h.created_at) > _JOB_TTL]
+    for jid in stale:
+        h = _jobs.pop(jid)
+        try:
+            os.remove(h.status_file)
+        except Exception:
+            pass
 
 
 @router.post("/ingest")
@@ -95,26 +105,36 @@ async def ingest_video(request: VideoIngestRequest):
                 "status": "already_exists", "message": f"Video {video_id} already indexed"}
 
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = _JobState(job_id=job_id, video_id=video_id,
-                               status="queued", stage="Queued…")
-    _executor.submit(_run_ingest, job_id, request.video_url, video_id)
+    status_file = os.path.join(_JOBS_DIR, f"{job_id}.json")
+    _write_status(status_file, "queued", "Queued…")
+
+    p = multiprocessing.Process(
+        target=_run_ingest_proc,
+        args=(status_file, request.video_url, video_id),
+        daemon=True,
+    )
+    p.start()
+
+    _jobs[job_id] = _JobHandle(job_id=job_id, video_id=video_id, status_file=status_file)
     return {"job_id": job_id, "video_id": video_id, "status": "queued"}
 
 
 @router.get("/ingest/status/{job_id}")
 async def ingest_status(job_id: str):
-    job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, "Job not found or expired")
-    if job.status in ("done", "error") and (time.monotonic() - job.created_at) > _JOB_TTL:
-        del _jobs[job_id]
-        raise HTTPException(404, "Job expired")
+    handle = _jobs.get(job_id)
+    if handle is None:
+        status_file = os.path.join(_JOBS_DIR, f"{job_id}.json")
+        if not os.path.exists(status_file):
+            raise HTTPException(404, "Job not found or expired")
+        handle = _JobHandle(job_id=job_id, video_id="unknown", status_file=status_file)
+
+    data = handle.read()
     return {
-        "job_id": job.job_id,
-        "video_id": job.video_id,
-        "status": job.status,
-        "stage": job.stage,
-        "error": job.error,
+        "job_id": job_id,
+        "video_id": handle.video_id,
+        "status": data.get("status", "unknown"),
+        "stage": data.get("stage", ""),
+        "error": data.get("error"),
     }
 
 
