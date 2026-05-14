@@ -172,14 +172,14 @@ _STOPWORDS = {"a","an","the","is","are","was","were","in","on","at","of","and","
               "to","with","for","this","that","it","its","be","by","as","from"}
 
 def _caption_evidence_filter(hits: list, q: str,
-                             strict_min: float = 0.27,
-                             trust_above: float = 0.25) -> list:
-    """Drop low-scoring hits when no hit has caption/object evidence for the query.
+                             strict_min: float = 0.50) -> list:
+    """Keep only hits with per-hit caption/object evidence for the query.
 
-    Two escape hatches prevent false negatives:
-    - Caption evidence: if any hit's caption/objects mention a query token, skip filter.
-    - X-CLIP confidence: if any hit scores >= trust_above, X-CLIP is confident enough
-      to trust even without caption evidence (e.g. Florence-2 called a knife a 'utensil').
+    When YOLO found nothing in a video, X-CLIP scores alone are unreliable —
+    prompt ensembling can push irrelevant frames (e.g. music videos) above 0.45.
+    We require actual caption or object-label evidence per hit.
+    Fallback: if no hit has evidence, keep hits scoring >= strict_min (very high
+    bar, only truly exceptional X-CLIP confidence passes without corroboration).
     """
     if not hits or not q:
         return hits
@@ -190,11 +190,10 @@ def _caption_evidence_filter(hits: list, q: str,
     def _caption_text(h: dict) -> str:
         return ((h.get("caption") or "") + " " +
                 " ".join(str(o) for o in (h.get("objects") or []))).lower()
-    has_evidence = any(any(t in _caption_text(h) for t in tokens) for h in hits)
-    if has_evidence:
-        return hits
-    if any(float(h.get("score", 0)) >= trust_above for h in hits):
-        return hits
+    evidence_hits = [h for h in hits if any(t in _caption_text(h) for t in tokens)]
+    if evidence_hits:
+        return evidence_hits
+    # No caption/object evidence anywhere — require very high X-CLIP score
     return [h for h in hits if float(h.get("score", 0)) >= strict_min]
 
 
@@ -281,7 +280,7 @@ def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[s
     obj_hits = _search_by_objects(video_id, q)
     faiss_hits = vis_hits + act_hits + txt_hits
     if not obj_hits:
-        faiss_hits = _caption_evidence_filter(faiss_hits, q, strict_min=0.27, trust_above=0.25)
+        faiss_hits = _caption_evidence_filter(faiss_hits, q)
     return faiss_hits + obj_hits
 
 
