@@ -1,5 +1,5 @@
 # backend/routers/search.py
-import os, json, logging
+import os, json, logging, re
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from models import (
@@ -30,6 +30,24 @@ def _get_xclip():
         from visual_ingest import XCLIPEncoder
         _XCLIP = XCLIPEncoder()
     return _XCLIP
+
+
+# Prompt templates for ensembling — averaging their embeddings gives better recall
+_QUERY_TEMPLATES = [
+    "{}",
+    "a photo of {}",
+    "a video of {}",
+    "close-up of {}",
+]
+
+def _build_query_vector(q: str):
+    """Batch-encode query with multiple phrasings and return mean-pooled vector."""
+    import numpy as np
+    enc = _get_xclip()
+    prompts = [t.format(q) for t in _QUERY_TEMPLATES]
+    vecs = enc.encode_text(prompts)          # (N, D), already L2-normalised
+    mean = vecs.mean(axis=0)
+    return (mean / (np.linalg.norm(mean) + 1e-12)).reshape(1, -1).astype("float32")
 
 
 
@@ -146,7 +164,163 @@ def _score_range(hits: list) -> ScoreRange:
     return ScoreRange(min=min(scores), max=max(scores))
 
 
-def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False) -> bool:
+# Minimum cosine similarity for visual/action hits — anything below is noise.
+# X-CLIP good matches are typically 0.25–0.45; below 0.18 is essentially random.
+_VISUAL_MIN_SCORE: float = 0.18
+
+_STOPWORDS = {"a","an","the","is","are","was","were","in","on","at","of","and","or",
+              "to","with","for","this","that","it","its","be","by","as","from"}
+
+def _caption_evidence_filter(hits: list, q: str,
+                             strict_min: float = 0.27,
+                             trust_above: float = 0.25) -> list:
+    """Drop low-scoring hits when no hit has caption/object evidence for the query.
+
+    Two escape hatches prevent false negatives:
+    - Caption evidence: if any hit's caption/objects mention a query token, skip filter.
+    - X-CLIP confidence: if any hit scores >= trust_above, X-CLIP is confident enough
+      to trust even without caption evidence (e.g. Florence-2 called a knife a 'utensil').
+    """
+    if not hits or not q:
+        return hits
+    tokens = [t for t in re.sub(r"[^a-z0-9 ]", " ", q.lower()).split()
+              if t and t not in _STOPWORDS and len(t) > 1]
+    if not tokens:
+        return hits
+    def _caption_text(h: dict) -> str:
+        return ((h.get("caption") or "") + " " +
+                " ".join(str(o) for o in (h.get("objects") or []))).lower()
+    has_evidence = any(any(t in _caption_text(h) for t in tokens) for h in hits)
+    if has_evidence:
+        return hits
+    if any(float(h.get("score", 0)) >= trust_above for h in hits):
+        return hits
+    return [h for h in hits if float(h.get("score", 0)) >= strict_min]
+
+
+def _caption_rerank(hits: list, q: str, boost: float = 0.10) -> list:
+    """Additive score boost for hits whose caption/objects contain query tokens."""
+    if not hits or not q:
+        return hits
+    tokens = [t for t in re.sub(r"[^a-z0-9 ]", " ", q.lower()).split()
+              if t and t not in _STOPWORDS and len(t) > 1]
+    if not tokens:
+        return hits
+    for h in hits:
+        text = " ".join(filter(None, [
+            (h.get("caption") or "").lower(),
+            " ".join(str(o) for o in (h.get("objects") or [])).lower(),
+        ]))
+        matched = sum(1 for t in tokens if t in text)
+        if matched:
+            h["score"] = float(h["score"]) + boost * (matched / len(tokens))
+    hits.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
+    return hits
+
+
+def _search_by_objects(video_id: str, q: str) -> list:
+    """Return frames where any YOLO/caption object exactly matches a query token.
+
+    Complements X-CLIP: catches cases where the model detected the right object
+    (e.g. knife) but the frame's visual embedding didn't score above threshold.
+    Score is fixed at 0.30 — above noise floor, below a strong X-CLIP match.
+    """
+    tokens = {t for t in re.sub(r"[^a-z0-9 ]", " ", q.lower()).split()
+              if t and t not in _STOPWORDS and len(t) > 1}
+    if not tokens:
+        return []
+    from db import db
+    hits = []
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT start, end, frame, objects, caption FROM visual_chunks WHERE video_id=?",
+            (video_id,)
+        ).fetchall()
+    for start, end, frame, objects_json, caption in rows:
+        objects = _parse_objects(objects_json)
+        if tokens & {o.lower() for o in objects}:
+            hits.append({
+                "video_id": video_id,
+                "start": float(start),
+                "end": float(end),
+                "score": 0.30,
+                "frame": frame,
+                "objects": objects,
+                "caption": caption or "",
+            })
+    return hits
+
+
+def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[str], qv=None) -> list:
+    """Run visual + action + text + object-match searches and merge results."""
+    if qv is None:
+        qv = _build_query_vector(q)
+    vis_hits: list = []
+    act_hits: list = []
+    txt_hits: list = []
+    try:
+        vis_hits = search_visual_single(video_id, q, k * 2, filter_objects, qv=qv)
+    except FileNotFoundError:
+        pass
+    try:
+        act_hits = search_action_single(video_id, q, k * 2, filter_objects, qv=qv)
+    except FileNotFoundError:
+        pass
+    try:
+        txt_hits = search_text_single(video_id, q, k * 2)
+        for h in txt_hits:
+            if not h.get("frame"):
+                h["frame"] = representative_frame_for_segment(video_id, h["start"], h["end"])
+    except FileNotFoundError:
+        pass
+    if not vis_hits and not act_hits and not txt_hits:
+        raise FileNotFoundError(f"No indexes for {video_id}")
+    for h in act_hits:
+        if not h.get("frame"):
+            h["frame"] = representative_frame_for_segment(video_id, h["start"], h["end"])
+    obj_hits = _search_by_objects(video_id, q)
+    faiss_hits = vis_hits + act_hits + txt_hits
+    if not obj_hits:
+        faiss_hits = _caption_evidence_filter(faiss_hits, q, strict_min=0.27, trust_above=0.25)
+    return faiss_hits + obj_hits
+
+
+def _all_vids_with_visual_chunks(restrict: Optional[list]) -> list:
+    """All video_ids that have visual_chunks rows in the DB."""
+    from db import db
+    with db() as conn:
+        rows = conn.execute("SELECT DISTINCT video_id FROM visual_chunks").fetchall()
+    vids = [r[0] for r in rows]
+    return [v for v in vids if not restrict or v in restrict]
+
+
+def search_auto_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
+    vis_vids = set(_globally(".svfaiss", restrict_videos))
+    act_vids = set(_globally(".xaclip.faiss", restrict_videos))
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    # FAISS search: only videos that passed context filter (or all indexed if no filter hit)
+    faiss_vids = set(candidates) if candidates else (vis_vids | act_vids)
+    # Build ensemble query vector once for all FAISS searches
+    qv = _build_query_vector(q)
+    all_hits: list = []
+    for vid in faiss_vids:
+        try:
+            all_hits.extend(search_auto_single(vid, q, k, filter_objects, qv=qv))
+        except Exception:
+            logger.warning("auto global skipped %s", vid, exc_info=True)
+    # Object-match search: all videos in DB, not gated by context filter
+    for vid in _all_vids_with_visual_chunks(restrict_videos):
+        if vid in faiss_vids:
+            continue  # search_auto_single already ran _search_by_objects for this vid
+        try:
+            all_hits.extend(_search_by_objects(vid, q))
+        except Exception:
+            pass
+    all_hits.sort(key=lambda h: h["score"], reverse=True)
+    return all_hits
+
+
+def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=False, need_auto=False) -> bool:
     ok = True
     if need_text:
         ok &= os.path.exists(os.path.join(_indexes_dir, f"{video_id}.faiss"))
@@ -155,6 +329,11 @@ def have_indexes(video_id: str, need_text=False, need_visual=False, need_action=
     if need_action:
         ok &= (os.path.exists(os.path.join(_indexes_dir, f"{video_id}.xaclip.faiss")) or
                os.path.exists(os.path.join(_indexes_dir, f"{video_id}.saclip.faiss")))
+    if need_auto:
+        has_vis = os.path.exists(os.path.join(_indexes_dir, f"{video_id}.svfaiss"))
+        has_act = (os.path.exists(os.path.join(_indexes_dir, f"{video_id}.xaclip.faiss")) or
+                   os.path.exists(os.path.join(_indexes_dir, f"{video_id}.saclip.faiss")))
+        ok &= (has_vis or has_act)
     return ok
 
 
@@ -197,13 +376,14 @@ def search_text_single(video_id: str, q: str, k: int) -> list:
             for s, idx in zip(D[0].tolist(), I[0].tolist()) if idx != -1]
 
 
-def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str]) -> list:
+def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str], qv=None) -> list:
     index, rows = load_siglip_visual_index(video_id)
-    qv = _get_xclip().encode_text([q])
+    if qv is None:
+        qv = _build_query_vector(q)
     D, I = index.search(qv, k)
     out = []
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1:
+        if idx == -1 or float(s) < _VISUAL_MIN_SCORE:
             continue
         _, start, end, frame, objects, caption = rows[idx]
         objs = _parse_objects(objects)
@@ -214,13 +394,14 @@ def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional
     return out
 
 
-def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional[str]) -> list:
+def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional[str], qv=None) -> list:
     index, rows = load_xclip_action_index(video_id)
-    qv = _get_xclip().encode_text([q])
+    if qv is None:
+        qv = _build_query_vector(q)
     D, I = index.search(qv, k)
     out = []
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
-        if idx == -1:
+        if idx == -1 or float(s) < _VISUAL_MIN_SCORE:
             continue
         _, start, end, objects_json, caption = rows[idx]
         objs = _parse_objects(objects_json)
@@ -247,10 +428,11 @@ def search_text_global(q: str, k: int, restrict_videos=None) -> list:
 def search_visual_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
     vids = candidates if candidates else _globally(".svfaiss", restrict_videos)
+    qv = _build_query_vector(q)
     all_hits = []
     for vid in vids:
         try:
-            all_hits.extend(search_visual_single(vid, q, k, filter_objects))
+            all_hits.extend(search_visual_single(vid, q, k, filter_objects, qv=qv))
         except Exception:
             logger.warning("visual global skipped %s", vid, exc_info=True)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
@@ -261,10 +443,11 @@ def search_action_global(q: str, k: int, filter_objects=None, restrict_videos=No
     xclip_vids = set(_globally(".xaclip.faiss", restrict_videos))
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
     vids = [v for v in candidates if v in xclip_vids] if candidates else list(xclip_vids)
+    qv = _build_query_vector(q)
     all_hits = []
     for vid in vids:
         try:
-            all_hits.extend(search_action_single(vid, q, k, filter_objects))
+            all_hits.extend(search_action_single(vid, q, k, filter_objects, qv=qv))
         except Exception:
             logger.warning("action global skipped %s", vid, exc_info=True)
     all_hits.sort(key=lambda h: h["score"], reverse=True)
@@ -307,6 +490,7 @@ def unified_query(body: UnifiedSearchRequest):
             need_text=body.mode == "text",
             need_visual=body.mode == "visual",
             need_action=body.mode == "action",
+            need_auto=body.mode == "auto",
         ):
             from ingest import ingest as do_ingest
             from visual_ingest import ingest_visual as do_visual
@@ -331,6 +515,7 @@ def unified_query(body: UnifiedSearchRequest):
             except FileNotFoundError:
                 raise HTTPException(404, f"No visual index for video {vid} — ingest first")
             _caption_hits_from_cache(vid, raw)
+            raw = _caption_rerank(raw, body.query or "")
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
@@ -348,12 +533,30 @@ def unified_query(body: UnifiedSearchRequest):
                 if not h.get("frame"):
                     h["frame"] = representative_frame_for_segment(vid, h["start"], h["end"])
             _caption_hits_from_cache(vid, raw)
+            raw = _caption_rerank(raw, body.query or "")
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
             return UnifiedSearchResponse(video_id=vid, mode="action",
+                                         hits=[_as_unified(h) for h in raw], score_range=sr)
+
+        if body.mode == "auto":
+            try:
+                raw = search_auto_single(vid, body.query or "", body.k * 3, body.filter_objects)
+            except FileNotFoundError:
+                raise HTTPException(404, f"No visual or action index for {vid} — ingest first")
+            _caption_hits_from_cache(vid, raw)
+            raw = _caption_rerank(raw, body.query or "")
+            if body.filter_objects:
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
+            sr = _score_range(raw)
+            raw = dedupe_hits(raw, key_mode="auto")
+            raw = nms_time(raw, tol=2.0)
+            raw = raw[:body.k]
+            return UnifiedSearchResponse(video_id=vid, mode="auto",
                                          hits=[_as_unified(h) for h in raw], score_range=sr)
 
         raise HTTPException(400, f"Unknown mode {body.mode}")
@@ -371,6 +574,7 @@ def unified_query(body: UnifiedSearchRequest):
                                        filter_objects=body.filter_objects,
                                        restrict_videos=restrict)
             _caption_hits_from_cache(None, raw)
+            raw = _caption_rerank(raw, body.query or "")
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
@@ -387,12 +591,29 @@ def unified_query(body: UnifiedSearchRequest):
                 if not h.get("frame"):
                     h["frame"] = representative_frame_for_segment(h["video_id"], h["start"], h["end"])
             _caption_hits_from_cache(None, raw)
+            raw = _caption_rerank(raw, body.query or "")
             if body.filter_objects:
                 raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
             raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
             sr = _score_range(raw)
             raw = _postproc_hits(raw, key_mode="time", k=body.k)
             return UnifiedSearchResponse(video_id=None, mode="action",
+                                         hits=[_as_unified(h) for h in raw], score_range=sr)
+
+        if body.mode == "auto":
+            raw = search_auto_global(body.query or "", body.k * 3,
+                                     filter_objects=body.filter_objects,
+                                     restrict_videos=restrict)
+            _caption_hits_from_cache(None, raw)
+            raw = _caption_rerank(raw, body.query or "")
+            if body.filter_objects:
+                raw = [h for h in raw if _hit_matches_filter(h, body.filter_objects)]
+            raw.sort(key=lambda h: float(h.get("score", 0.0)), reverse=True)
+            sr = _score_range(raw)
+            raw = dedupe_hits(raw, key_mode="auto")
+            raw = nms_time(raw, tol=2.0)
+            raw = raw[:body.k]
+            return UnifiedSearchResponse(video_id=None, mode="auto",
                                          hits=[_as_unified(h) for h in raw], score_range=sr)
 
         raise HTTPException(400, "Unknown or unsupported mode for scope='global'")

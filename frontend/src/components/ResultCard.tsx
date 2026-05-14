@@ -52,6 +52,7 @@ function ScorePill({ pct }: { pct: number }) {
 
 export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
   const [open, setOpen] = useState(false)
+
   const pct = normalizeScore(hit.score, scoreRange)
   const isYT = isYouTubeId(hit.video_id)
   const hasFrame = Boolean(hit.frame)
@@ -125,18 +126,21 @@ export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
               className="w-[min(94vw,820px)]">
         <div className="space-y-4">
           {open && <VideoPlayer videoId={hit.video_id} startSeconds={hit.start} endSeconds={hit.end} />}
+
           {hasText && (
             <section>
               <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">Transcript</h3>
               <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">"{hit.text}"</p>
             </section>
           )}
+
           {hasCaption && (
             <section>
               <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">Caption</h3>
               <p className="rounded-md border border-border bg-surface/50 px-3 py-2 text-sm text-fg leading-relaxed">{caption}</p>
             </section>
           )}
+
           {objects.length > 0 && (
             <section>
               <h3 className="text-xxs font-medium uppercase tracking-wide text-subtle mb-1.5">Keywords</h3>
@@ -145,6 +149,7 @@ export function ResultCard({ hit, index, title, scoreRange }: ResultCardProps) {
               </div>
             </section>
           )}
+
           <div className="flex gap-2 pt-1">
             {isYT && (
               <Button variant="secondary" size="md" className="flex-1"

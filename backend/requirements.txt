@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 yt-dlp
-openai-whisper
+mlx-whisper
 sentence-transformers
 faiss-cpu
 pydantic[dotenv]
@@ -20,3 +20,4 @@ timm
 sentencepiece
 protobuf
 pyvips
+ultralyticsnltk

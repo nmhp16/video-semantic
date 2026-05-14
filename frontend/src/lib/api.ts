@@ -32,7 +32,7 @@ export interface UnifiedSearchHit {
 
 export interface UnifiedSearchResponse {
   video_id: string | null
-  mode: 'text' | 'visual' | 'action'
+  mode: SearchMode
   hits: UnifiedSearchHit[]
   score_range: ScoreRange | null
 }
@@ -59,7 +59,7 @@ export interface IngestResponse {
   status: 'completed' | 'already_exists'
 }
 
-export type SearchMode = 'text' | 'visual' | 'action'
+export type SearchMode = 'text' | 'visual' | 'action' | 'auto'
 export type SearchScope = 'video' | 'global'
 
 export interface UnifiedSearchRequest {
@@ -74,13 +74,27 @@ export interface UnifiedSearchRequest {
   videos?: string[]
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, init)
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(body || `HTTP ${res.status}`)
+async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  // If caller passed a signal, combine it with the timeout via any
+  const externalSignal = init?.signal as AbortSignal | undefined
+  const signal = externalSignal
+    ? AbortSignal.any([externalSignal, timeout])
+    : timeout
+  const { signal: _drop, ...restInit } = init ?? {}
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, { ...restInit, signal })
+    if (!res.ok) {
+      const body = await res.text()
+      throw new Error(body || `HTTP ${res.status}`)
+    }
+    return res.json() as Promise<T>
+  } catch (e) {
+    if (e instanceof Error && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
+      throw new Error('Request timed out')
+    }
+    throw e
   }
-  return res.json() as Promise<T>
 }
 
 export const api = {
@@ -98,6 +112,30 @@ export const api = {
     })
   },
 
+  ingestFile(file: File, onProgress?: (pct: number) => void): Promise<IngestJobResponse> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      const form = new FormData()
+      form.append('file', file)
+      xhr.open('POST', `${BASE_URL}/ingest/upload`)
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable && onProgress) {
+          onProgress(Math.round((e.loaded / e.total) * 100))
+        }
+      })
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)) }
+          catch { reject(new Error('Invalid response')) }
+        } else {
+          reject(new Error(xhr.responseText || `HTTP ${xhr.status}`))
+        }
+      })
+      xhr.addEventListener('error', () => reject(new Error('Upload failed')))
+      xhr.send(form)
+    })
+  },
+
   ingestStatus(jobId: string): Promise<JobStatusResponse> {
     return request(`/ingest/status/${encodeURIComponent(jobId)}`)
   },
@@ -110,11 +148,12 @@ export const api = {
     })
   },
 
-  query(req: UnifiedSearchRequest): Promise<UnifiedSearchResponse> {
+  query(req: UnifiedSearchRequest, signal?: AbortSignal): Promise<UnifiedSearchResponse> {
     return request('/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
+      signal,
     })
   },
 

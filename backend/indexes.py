@@ -58,6 +58,8 @@ def _save_ip_index(path: str, embeddings: np.ndarray):
 
 # --- Text index ---
 def save_index(video_id: str, embeddings: np.ndarray, chunks: list):
+    if embeddings.ndim < 2 or embeddings.shape[0] == 0:
+        return  # no transcript chunks — skip text index
     from db import db
     _save_ip_index(INDEX_PATH(video_id), embeddings)
     with db() as conn:

@@ -20,7 +20,7 @@ class VideoIngestRequest(BaseModel):
     video_url: str
     video_id: Optional[str] = None  # If not provided, will be extracted from URL
 
-MODE = Literal["text", "visual", "action"]
+MODE = Literal["text", "visual", "action", "auto"]
 
 # Keep search fan-out bounded so a single client can't request thousands
 # of hits (every hit may trigger lazy Florence-2 captioning).
@@ -53,12 +53,6 @@ class UnifiedSearchResponse(BaseModel):
     hits: List[UnifiedSearchHit] = Field(default_factory=list)
     info: dict = Field(default_factory=dict)
     score_range: Optional["ScoreRange"] = None
-
-class OVVerifyRequest(BaseModel):
-    frames: List[str]
-    prompts: List[str]
-    box_threshold: float = 0.25
-    text_threshold: float = 0.25
 
 class ScoreRange(BaseModel):
     min: float

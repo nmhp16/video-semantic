@@ -2,6 +2,7 @@ import { cn } from '@/lib/utils'
 import type { SearchMode } from '@/lib/api'
 
 const MODES: { id: SearchMode; label: string; hint: string }[] = [
+  { id: 'auto', label: 'Auto', hint: 'Fuses visual + action — best for most queries' },
   { id: 'text', label: 'Text', hint: 'Search spoken words and transcripts' },
   { id: 'visual', label: 'Visual', hint: 'Search by scene, object, or appearance' },
   { id: 'action', label: 'Action', hint: 'Search by activity or motion' },

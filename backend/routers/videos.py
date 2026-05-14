@@ -2,7 +2,6 @@
 import os, json, logging
 from fastapi import APIRouter, HTTPException, Path
 from typing import Optional, List
-from models import OVVerifyRequest
 from db import clear_video
 from indexes import evict_video
 
@@ -86,19 +85,3 @@ def delete_video(video_id: str = Path(..., pattern=_VIDEO_ID_RE)):
     return {"success": True, "video_id": video_id, **result}
 
 
-@router.post("/ov_verify")
-def ov_verify(req: OVVerifyRequest):
-    from detection import detect_on_image
-    out = {}
-    for f in req.frames:
-        try:
-            res = detect_on_image(
-                image_path=os.path.abspath(f),
-                prompts=req.prompts,
-                box_threshold=req.box_threshold,
-                text_threshold=req.text_threshold,
-            )
-            out[f] = res
-        except Exception as e:
-            out[f] = {"detections": [], "debug": {"error": str(e)}}
-    return {"results": out}

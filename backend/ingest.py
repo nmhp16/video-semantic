@@ -1,19 +1,10 @@
 import os, json, subprocess, re
 from pathlib import Path
-import whisper
 import numpy as np
 from chunking import chunk_segments
 from store import DATA, save_index
 from embeddings import get_emb
 from utils_unified import YT_ID_RE
-
-_whisper_model = None
-
-def _get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        _whisper_model = whisper.load_model("turbo")
-    return _whisper_model
 
 MEDIA = os.path.join(DATA, "media")
 TRANS = os.path.join(DATA, "transcripts")
@@ -46,7 +37,8 @@ def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])
 
 def transcribe(wav_path: str):
-    result = _get_whisper().transcribe(wav_path, word_timestamps=False)
+    import mlx_whisper
+    result = mlx_whisper.transcribe(wav_path, path_or_hf_repo="mlx-community/whisper-turbo")
     return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
 
 def embed_texts(texts: list[str]):

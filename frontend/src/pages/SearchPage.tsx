@@ -17,6 +17,7 @@ import type {
 import { useSearchHistory } from '@/hooks/useSearchHistory'
 
 const PLACEHOLDERS: Record<SearchMode, string> = {
+  auto: 'Describe anything — scene, action, or object…',
   text: 'Search transcripts…',
   visual: 'Describe a scene or object…',
   action: 'Describe an action or activity…',
@@ -24,7 +25,7 @@ const PLACEHOLDERS: Record<SearchMode, string> = {
 
 export function SearchPage() {
   const [query, setQuery] = useState('')
-  const [mode, setMode] = useState<SearchMode>('visual')
+  const [mode, setMode] = useState<SearchMode>('auto')
   const [scope, setScope] = useState<SearchScope>('video')
   const [selectedVideo, setSelectedVideo] = useState('')
   const [filterObjects, setFilterObjects] = useState('')
@@ -39,6 +40,7 @@ export function SearchPage() {
   const { history, push: pushHistory, remove: removeHistory } = useSearchHistory()
   const [inputFocused, setInputFocused] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const searchAbortRef = useRef<AbortController | null>(null)
 
   const videoTitles = Object.fromEntries(
     videos.filter((v) => v.title).map((v) => [v.video_id, v.title!])
@@ -82,6 +84,10 @@ export function SearchPage() {
     if (!q) return
     if (scope === 'video' && !selectedVideo) return
 
+    searchAbortRef.current?.abort()
+    const controller = new AbortController()
+    searchAbortRef.current = controller
+
     setLoading(true)
     setError(null)
     setSearched(true)
@@ -95,11 +101,12 @@ export function SearchPage() {
         filter_objects: filterObjects.trim() || undefined,
         k: 24,
         ingest_if_needed: false,
-      })
+      }, controller.signal)
       setHits(res.hits)
       setScoreRange(res.score_range ?? null)
       pushHistory(q, mode)
     } catch (e) {
+      if (e instanceof Error && e.message === 'canceled') return
       setError(e instanceof Error ? e.message : 'Search failed')
       setHits([])
     } finally {

@@ -40,12 +40,21 @@ app.include_router(videos.router)
 @app.on_event("startup")
 async def startup():
     init_db()
+    from routers.ingest import start_worker
+    start_worker()
     import threading
     def _warm():
+        log = logging.getLogger(__name__)
         try:
             from routers.search import _get_xclip
             _get_xclip()
-            logging.getLogger(__name__).info("X-CLIP ready on MPS")
+            log.info("X-CLIP ready")
         except Exception:
-            logging.getLogger(__name__).exception("X-CLIP pre-warm failed")
+            log.exception("X-CLIP pre-warm failed")
+        try:
+            from embeddings import get_emb
+            get_emb()
+            log.info("SentenceTransformer ready")
+        except Exception:
+            log.exception("SentenceTransformer pre-warm failed")
     threading.Thread(target=_warm, daemon=True).start()
