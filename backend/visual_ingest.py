@@ -3,7 +3,7 @@ from typing import List, Dict
 from PIL import Image
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM
 from store import (
     DATA,
     save_visual_metadata, save_action_clips_metadata,
@@ -125,7 +125,7 @@ def sample_frames(video_path: str, out_dir: str,
 
     return out
 
-# --- Caption keyword extraction (replaces Florence-2 <OD> pass) ---
+# --- Caption keyword extraction ---
 _WORD_RE = re.compile(r"[A-Za-z]{3,}")
 _STOPWORDS = {
     "the","and","with","that","this","from","into","onto","over","under","near","upon",
@@ -197,6 +197,17 @@ class XCLIPEncoder:
             self._device = "cpu"
         self.processor = XCLIPProcessor.from_pretrained(model_id)
         self.model = XCLIPModel.from_pretrained(model_id).to(self._device).eval()
+        # Cached dummy text/video tensors — required because the full forward pass
+        # needs both modalities even when we only need one side's embeddings.
+        _dummy_txt = self.processor(text=["a"], return_tensors="pt", padding=True)
+        self._dummy_input_ids = _dummy_txt["input_ids"]          # (1, seq)
+        self._dummy_attn_mask = _dummy_txt["attention_mask"]     # (1, seq)
+        _dummy_frames = [Image.new("RGB", (224, 224))] * self.N_FRAMES
+        self._dummy_pv = self.processor(images=_dummy_frames, return_tensors="pt")["pixel_values"]  # (1,N,C,H,W)
+
+    def _proc_video(self, pil_frames: List[Image.Image]) -> torch.Tensor:
+        """Process exactly N_FRAMES PIL images → (1, N, C, H, W) pixel_values."""
+        return self.processor(images=pil_frames, return_tensors="pt")["pixel_values"]
 
     def _uniform_sample(self, paths: List[str]) -> List[Image.Image]:
         n = self.N_FRAMES
@@ -217,16 +228,26 @@ class XCLIPEncoder:
                 img.close()
 
     def encode_clip(self, pil_frames: List[Image.Image]) -> np.ndarray:
-        inputs = self.processor(videos=[pil_frames], return_tensors="pt").to(self._device)
+        pv = self._proc_video(pil_frames).to(self._device)        # (1, N, C, H, W)
+        dummy_ids = self._dummy_input_ids.to(self._device)
+        dummy_mask = self._dummy_attn_mask.to(self._device)
         with torch.no_grad():
-            feats = self.model.get_video_features(**inputs)
+            out = self.model(pixel_values=pv, input_ids=dummy_ids, attention_mask=dummy_mask)
+        feats = out.video_embeds                                   # (1, dim)
         feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         return feats.float().cpu().numpy()[0]
 
     def encode_text(self, texts: List[str]) -> np.ndarray:
-        inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self._device)
+        n = len(texts)
+        dummy_pv = self._dummy_pv.expand(n, -1, -1, -1, -1).to(self._device)
+        t = self.processor(text=texts, return_tensors="pt", padding=True)
         with torch.no_grad():
-            feats = self.model.get_text_features(**inputs)
+            out = self.model(
+                pixel_values=dummy_pv,
+                input_ids=t["input_ids"].to(self._device),
+                attention_mask=t["attention_mask"].to(self._device),
+            )
+        feats = out.text_embeds                                    # (n, dim)
         feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         return feats.float().cpu().numpy().astype("float32")
 
@@ -236,17 +257,21 @@ class XCLIPEncoder:
         results = []
         for i in range(0, total, batch_size):
             batch_paths = paths[i:i + batch_size]
-            batch_imgs = [Image.open(p).convert("RGB") for p in batch_paths]
-            try:
-                videos = [[img] * self.N_FRAMES for img in batch_imgs]
-                inputs = self.processor(videos=videos, return_tensors="pt").to(self._device)
-                with torch.no_grad():
-                    feats = self.model.get_video_features(**inputs)
-                feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                results.append(feats.float().cpu().numpy())
-            finally:
-                for img in batch_imgs:
-                    img.close()
+            pv_list = []
+            for path in batch_paths:
+                img = Image.open(path).convert("RGB")
+                pv = self._proc_video([img] * self.N_FRAMES)      # (1, N, C, H, W)
+                img.close()
+                pv_list.append(pv)
+            batch_pv = torch.cat(pv_list, dim=0).to(self._device) # (B, N, C, H, W)
+            b = batch_pv.shape[0]
+            dummy_ids = self._dummy_input_ids.expand(b, -1).to(self._device)
+            dummy_mask = self._dummy_attn_mask.expand(b, -1).to(self._device)
+            with torch.no_grad():
+                out = self.model(pixel_values=batch_pv, input_ids=dummy_ids, attention_mask=dummy_mask)
+            feats = out.video_embeds                               # (B, dim)
+            feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            results.append(feats.float().cpu().numpy())
             print(f"  xclip frames {min(i + batch_size, total)}/{total}")
         return np.concatenate(results, axis=0).astype("float32")
 
@@ -290,47 +315,60 @@ def build_xclip_clips(frames, xclip: XCLIPEncoder,
     return np.stack(clip_vecs).astype("float32"), clip_rows
 
 
-# --- Florence-2-large captioning ---
-class Florence2Captioner:
-    _MODEL_ID = "microsoft/Florence-2-large"
+# --- Moondream2 captioner ---
+class Moondream2Captioner:
+    _MODEL_ID = "vikhyatk/moondream2"
 
     def __init__(self):
         if torch.cuda.is_available():
+            # CUDA: 4-bit NF4, float16 compute — fastest + smallest (~1.5 GB)
+            from transformers import BitsAndBytesConfig
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self._MODEL_ID, trust_remote_code=True,
+                quantization_config=bnb_cfg, device_map="auto",
+            ).eval()
             self._device = "cuda"
         elif torch.backends.mps.is_available():
+            # Apple Silicon MPS: bitsandbytes has no MPS kernel, so just load in
+            # float16 on-device (~3.7 GB, faster than CPU float32 inference).
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self._MODEL_ID, trust_remote_code=True,
+                dtype=torch.float16,
+            ).to("mps").eval()
             self._device = "mps"
         else:
+            # CPU-only: bfloat16 saves ~half the RAM vs float32 (~3.7 GB vs ~7.4 GB).
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self._MODEL_ID, trust_remote_code=True,
+                dtype=torch.bfloat16,
+            ).eval()
             self._device = "cpu"
-        # float32 required — float16 has dtype mismatches on MPS with Florence-2
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self._MODEL_ID, trust_remote_code=True, torch_dtype=torch.float32,
-        ).to(self._device).eval()
-        self.processor = AutoProcessor.from_pretrained(self._MODEL_ID, trust_remote_code=True)
 
     def caption_batch(self, imgs: List[Image.Image]) -> List[Dict]:
-        """One forward pass for the whole batch — much faster than one-at-a-time."""
         if not imgs:
             return []
-        inputs = self.processor(
-            text=["<MORE_DETAILED_CAPTION>"] * len(imgs),
-            images=imgs,
-            return_tensors="pt",
-            padding=True,
-        )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with torch.no_grad():
-            ids = self.model.generate(**inputs, max_new_tokens=128, num_beams=1)
-        raws = self.processor.batch_decode(ids, skip_special_tokens=False)
         results = []
-        for raw, img in zip(raws, imgs):
-            caption = self.processor.post_process_generation(
-                raw, task="<MORE_DETAILED_CAPTION>", image_size=img.size
-            )["<MORE_DETAILED_CAPTION>"]
+        for img in imgs:
+            with torch.no_grad():
+                enc = self.model.encode_image(img)
+                result = self.model.caption(enc, length="normal")
+            if isinstance(result, dict):
+                caption = result.get("caption", "")
+            elif hasattr(result, "__iter__") and not isinstance(result, str):
+                caption = "".join(result)
+            else:
+                caption = str(result)
             results.append({"caption": caption, "objects": _caption_keywords(caption)})
         return results
 
 
-# --- YOLOv8 COCO object detector (augments Florence-2 objects list) ---
+# --- YOLOv8 COCO object detector ---
 class YOLODetector:
     def __init__(self, model_id: str = "yolov8s.pt", conf: float = 0.15):
         from ultralytics import YOLO as _YOLO
@@ -350,16 +388,16 @@ class YOLODetector:
 
 
 # Module-level singletons — kept warm between jobs in the persistent worker process.
-_captioner_instance: "Florence2Captioner | None" = None
+_captioner_instance: "Moondream2Captioner | None" = None
 _siglip_instance: "SigLIPEncoder | None" = None
 _xclip_instance: "XCLIPEncoder | None" = None
 _yolo_instance: "YOLODetector | None" = None
 
 
-def _get_captioner() -> Florence2Captioner:
+def _get_captioner() -> Moondream2Captioner:
     global _captioner_instance
     if _captioner_instance is None:
-        _captioner_instance = Florence2Captioner()
+        _captioner_instance = Moondream2Captioner()
     return _captioner_instance
 
 
@@ -446,15 +484,15 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
 
     if remaining:
         already_done = total_scene - len(remaining)
-        if progress_cb: progress_cb(f"Captioning {already_done}/{total_scene} scene frames (Florence-2)…")
-        print(f"Florence-2 captioning {len(remaining)}/{total_scene} scene-change frames...")
         captioner = _get_captioner()
+        if progress_cb: progress_cb(f"Captioning {already_done}/{total_scene} scene frames (Moondream2)…")
+        print(f"Moondream2 captioning {len(remaining)}/{total_scene} scene-change frames...")
         for rank, idx in enumerate(remaining):
             img = Image.open(frames[idx]["path"]).convert("RGB")
             scene_captions[idx] = captioner.caption_batch([img])[0]
             img.close()
             done = already_done + rank + 1
-            if progress_cb: progress_cb(f"Captioning {done}/{total_scene} scene frames (Florence-2)…")
+            if progress_cb: progress_cb(f"Captioning {done}/{total_scene} scene frames (Moondream2)…")
             if (rank + 1) % 5 == 0 or rank + 1 == len(remaining):
                 print(f"  captioned {done}/{total_scene} scene frames")
                 with open(_ckpt_path, "w") as _f:
@@ -472,7 +510,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
 
     # YOLO augmentation — detect COCO objects on every keyframe and merge into objects.
     # Each frame takes ~50ms so this adds only a few seconds total.
-    # This catches objects Florence-2 hallucinated over (e.g. knife described as sandwich).
+    # YOLO provides a second, calibrated pass — fills gaps where the caption model is imprecise.
     if progress_cb: progress_cb("Detecting objects (YOLO)…")
     print(f"YOLO detecting objects on {len(frames)} frames…")
     yolo = _get_yolo()

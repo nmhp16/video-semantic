@@ -7,7 +7,7 @@ Multi-modal video search. Ingest a YouTube URL or local file; search by transcri
 Ingestion runs two parallel pipelines:
 
 - **Audio** — `mlx-whisper` transcribes the audio track. Chunks are embedded with `BAAI/bge-small-en-v1.5` and stored in a FAISS index.
-- **Visual** — `ffmpeg` samples keyframes (scene-change detection + 2 s max gap). `Florence-2` generates a caption and object labels for each frame; `YOLOv8` (COCO, 80 classes) provides a second, calibrated pass at detection. Frame embeddings are built with `SigLIP`; sliding-window clip embeddings with `X-CLIP`.
+- **Visual** — `ffmpeg` samples keyframes (scene-change detection + 2 s max gap). `Moondream2` generates a caption and keyword labels for each scene-change frame; `YOLOv8` (COCO, 80 classes) provides a second, calibrated pass at object detection. Frame embeddings are built with `SigLIP`; sliding-window clip embeddings with `X-CLIP`.
 
 At query time the `auto` mode fuses all signals: transcript hits, SigLIP frame similarity, X-CLIP clip similarity, and direct YOLO object-label matching.
 
@@ -18,7 +18,7 @@ At query time the `auto` mode fuses all signals: transcript hits, SigLIP frame s
 | API | FastAPI |
 | UI | Vite + React + TypeScript |
 | Transcription | mlx-whisper |
-| Frame captioning | Florence-2-base |
+| Frame captioning | Moondream2 |
 | Object detection (ingest) | YOLOv8s (COCO 80-class) |
 | Frame embeddings | SigLIP |
 | Clip embeddings | X-CLIP |
@@ -34,7 +34,7 @@ video-semantic/
     app.py              FastAPI entry point, startup warm-up
     models.py           Pydantic request/response types
     ingest.py           Audio pipeline: download, Whisper, text index
-    visual_ingest.py    Visual pipeline: frame sampling, Florence-2,
+    visual_ingest.py    Visual pipeline: frame sampling, Moondream2,
                         YOLOv8, SigLIP + X-CLIP indexing
     ingest_worker.py    Per-job subprocess entry point (process isolation)
     context.py          Per-video context vectors for global pre-filtering
@@ -58,7 +58,19 @@ video-semantic/
 - `ffmpeg` and `ffprobe` on `PATH`
 - Apple Silicon (MPS) or CUDA recommended; CPU-only is supported but slow
 
+### Caption model
+
+Ingest uses Moondream2 for scene captioning.
+
+| | Moondream2 |
+|---|---|
+| RAM | ~3.7 GB (float16 on MPS/CPU), ~1.5 GB (4-bit NF4 on CUDA) |
+| Speed | ~13–14 s/frame on Apple Silicon MPS, ~10–12 s/frame on CUDA |
+| CPU only | Usable (~30–60 s/frame, bfloat16) |
+
 ## Setup
+
+### Apple Silicon (MPS)
 
 ```bash
 cd backend
@@ -66,11 +78,33 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
+### CUDA (Blackwell / any NVIDIA GPU)
+
+`mlx-whisper` is Apple-only and will fail on Linux. Install PyTorch for CUDA first, then skip it:
+
+```bash
+# PyTorch with CUDA 12.8 (Blackwell requires 12.8+)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
+# Install everything else — mlx-whisper will error; that's expected, ignore it
+pip install -r requirements.txt --ignore-requires-python || true
+
+# If mlx-whisper blocks the install entirely, install packages individually:
+# pip install fastapi uvicorn yt-dlp faster-whisper sentence-transformers faiss-cpu \
+#   pydantic[dotenv] python-multipart sqlite-utils opencv-python pillow \
+#   transformers>=4.57 accelerate bitsandbytes spacy bertopic einops timm \
+#   sentencepiece protobuf pyvips ultralytics nltk
+
+python -m spacy download en_core_web_sm
+```
+
+On first ingest, Moondream2 loads in 4-bit NF4 (~1.5 GB VRAM). Whisper turbo runs on CUDA automatically.
+
 ## Running
 
 ```bash
 cd backend
-uvicorn app:app --reload --port 8000
+uvicorn app:app --port 8000
 ```
 
 The server pre-warms X-CLIP and the sentence encoder on startup. Model weights are downloaded on first use; the initial ingest takes a few minutes.
@@ -107,7 +141,7 @@ curl http://localhost:8000/ingest/status/<job_id>
 
 `status` is one of `queued`, `running`, `done`, `error`. The `stage` field gives a progress description. Only one ingest runs at a time; submitting while one is active returns HTTP 409.
 
-Ingest runs as a subprocess so Florence-2 and YOLOv8 live in a separate process from the search server, avoiding shared-MPS memory pressure on Apple Silicon.
+Ingest runs as a subprocess so the caption model and YOLOv8 live in a separate process from the search server, avoiding shared-MPS memory pressure on Apple Silicon.
 
 ## Search
 
@@ -152,7 +186,7 @@ curl -X POST http://localhost:8000/query \
 # Auto search on a single video
 curl -X POST http://localhost:8000/query \
   -H 'Content-Type: application/json' \
-  -d '{"video_id":"zPxQjuFoUBc","mode":"auto","query":"knife","k":10}'
+  -d '{"video_id":"zPxQjuFoUBc","mode":"auto","query":"cutting tool","k":10}'
 
 # Action search filtered to frames containing a person
 curl -X POST http://localhost:8000/query \
@@ -166,16 +200,16 @@ curl -X POST http://localhost:8000/query \
 {
   "video_id": "zPxQjuFoUBc",
   "mode": "auto",
-  "score_range": {"min": 0.28, "max": 0.58},
+  "score_range": {"min": 0.28, "max": 0.51},
   "hits": [
     {
       "video_id": "zPxQjuFoUBc",
-      "start": 42.1,
-      "end": 44.3,
-      "score": 0.577,
-      "frame": "frames/zPxQjuFoUBc/frame-001234.jpg",
-      "objects": ["knife", "person", "cutting board"],
-      "caption": "A chef slicing meat on a wooden cutting board.",
+      "start": 9.3,
+      "end": 11.3,
+      "score": 0.512,
+      "frame": "frames/zPxQjuFoUBc/frame-000010.jpg",
+      "objects": ["cutter", "cutting", "tortilla", "wooden", "gloves"],
+      "caption": "A freshly cooked tortilla rests on a wooden cutting board. A hand wearing black gloves holds a silver tortilla cutter near the tortilla.",
       "text": null
     }
   ]
@@ -211,6 +245,6 @@ To fully reset, stop the server and delete `backend/data/`. To remove a single v
 
 **Prompt ensembling.** The search vector is the mean of embeddings for four phrasings of the query (`{}`, `a photo of {}`, `a video of {}`, `close-up of {}`). This improves recall for short queries without requiring query expansion heuristics.
 
-**Evidence filter.** In `auto` mode, when YOLO finds no object match for a query in a given video, FAISS hits must have Florence-2 caption or object-label corroboration to be returned. Hits with no caption evidence require an X-CLIP score above 0.50 to pass. This prevents unrelated videos from appearing via embedding drift alone.
+**Evidence filter.** In `auto` mode, when YOLO finds no object match for a query in a given video, FAISS hits must have caption or object-label corroboration to be returned. Hits with no caption evidence require an X-CLIP score above 0.50 to pass. This prevents unrelated videos from appearing via embedding drift alone. Because the filter uses caption text, queries that phrase things differently from the caption model's vocabulary (e.g. "knife" when the caption says "tortilla cutter") may return zero hits — use descriptive phrases like "cutting tool" or "slicing" instead.
 
-**Process isolation.** Each ingest job runs as a subprocess via `ingest_worker.py`. Florence-2 and YOLOv8 (ingest-time models) and X-CLIP + BGE (search-time models) never share an MPS process pool, which prevents OOM crashes on Apple Silicon.
+**Process isolation.** Each ingest job runs as a subprocess via `ingest_worker.py`. Moondream2 and YOLOv8 (ingest-time models) and X-CLIP + BGE (search-time models) never share an MPS process pool, which prevents OOM crashes on Apple Silicon.

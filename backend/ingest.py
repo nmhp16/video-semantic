@@ -37,9 +37,16 @@ def extract_audio(infile: str, outfile: str):
     subprocess.check_call(["ffmpeg","-y","-i", infile,"-vn","-ac","1","-ar","16000","-acodec","pcm_s16le", outfile])
 
 def transcribe(wav_path: str):
-    import mlx_whisper
-    result = mlx_whisper.transcribe(wav_path, path_or_hf_repo="mlx-community/whisper-turbo")
-    return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
+    import torch
+    if torch.cuda.is_available():
+        from faster_whisper import WhisperModel
+        model = WhisperModel("turbo", device="cuda", compute_type="float16")
+        segments, _ = model.transcribe(wav_path)
+        return [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
+    else:
+        import mlx_whisper
+        result = mlx_whisper.transcribe(wav_path, path_or_hf_repo="mlx-community/whisper-turbo")
+        return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in result["segments"]]
 
 def embed_texts(texts: list[str]):
     X = get_emb().encode(texts, normalize_embeddings=True)

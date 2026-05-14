@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 yt-dlp
-mlx-whisper
+faster-whisper
+mlx-whisper  # Apple Silicon only — skip on Linux (CUDA path uses faster-whisper)
 sentence-transformers
 faiss-cpu
 pydantic[dotenv]
@@ -11,7 +12,9 @@ opencv-python
 pillow
 torch
 torchvision
-transformers>=4.41,<4.50
+transformers>=4.57
+accelerate
+bitsandbytes
 spacy
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 bertopic
@@ -20,4 +23,5 @@ timm
 sentencepiece
 protobuf
 pyvips
-ultralyticsnltk
+ultralytics
+nltk
