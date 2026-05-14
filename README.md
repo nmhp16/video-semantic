@@ -1,232 +1,216 @@
-# Video Semantic Search
+# video-semantic
 
-A multi-modal video search service. Given a YouTube URL or local video file, the system produces an ASR transcript, per-frame captions, and frame/segment embeddings, then serves text, visual, and action search through a single FastAPI endpoint.
+Multi-modal video search. Ingest a YouTube URL or local file; search by transcript content, visual appearance, or on-screen activity.
 
-## Architecture
+## How it works
 
-| Component | Model |
-|-----------|-------|
-| Speech-to-text | OpenAI Whisper |
-| Text / caption embeddings | `BAAI/bge-small-en-v1.5` (SentenceTransformers) |
-| Frame captioning and object labels | `microsoft/Florence-2-base` |
-| On-demand open-vocabulary detection | `google/owlv2-base-patch16-ensemble` |
-| Vector index | FAISS (inner product on L2-normalized vectors) |
-| Metadata store | SQLite |
+Ingestion runs two parallel pipelines:
 
-Captions and transcripts share the same embedding space, so text queries and visual queries retrieve against consistent vectors.
+- **Audio** — `mlx-whisper` transcribes the audio track. Chunks are embedded with `BAAI/bge-small-en-v1.5` and stored in a FAISS index.
+- **Visual** — `ffmpeg` samples keyframes (scene-change detection + 2 s max gap). `Florence-2` generates a caption and object labels for each frame; `YOLOv8` (COCO, 80 classes) provides a second, calibrated pass at detection. Frame embeddings are built with `SigLIP`; sliding-window clip embeddings with `X-CLIP`.
 
-## Project Structure
+At query time the `auto` mode fuses all signals: transcript hits, SigLIP frame similarity, X-CLIP clip similarity, and direct YOLO object-label matching.
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| API | FastAPI |
+| UI | Vite + React + TypeScript |
+| Transcription | mlx-whisper |
+| Frame captioning | Florence-2-base |
+| Object detection (ingest) | YOLOv8s (COCO 80-class) |
+| Frame embeddings | SigLIP |
+| Clip embeddings | X-CLIP |
+| Text embeddings | BGE-small-en-v1.5 |
+| Vector search | FAISS (inner-product, L2-normalised) |
+| Metadata | SQLite |
+
+## Project layout
 
 ```
 video-semantic/
   backend/
-    app.py            FastAPI application and search endpoints
-    models.py         Pydantic request/response models
-    ingest.py         Download, audio extraction, Whisper transcription, text index
-    visual_ingest.py  Frame sampling, Florence-2 captioning, caption embedding,
-                      action-clip windows
-    gdino.py          OWLv2 open-vocabulary detector used by /ov_verify
-    store.py          FAISS and SQLite persistence, context filters
-    chunking.py       Transcript chunking utilities
-    utils_unified.py  URL / video-id helpers
+    app.py              FastAPI entry point, startup warm-up
+    models.py           Pydantic request/response types
+    ingest.py           Audio pipeline: download, Whisper, text index
+    visual_ingest.py    Visual pipeline: frame sampling, Florence-2,
+                        YOLOv8, SigLIP + X-CLIP indexing
+    ingest_worker.py    Per-job subprocess entry point (process isolation)
+    context.py          Per-video context vectors for global pre-filtering
+    indexes.py          FAISS read/write with LRU cache
+    db.py               SQLite schema and queries
+    embeddings.py       BGE singleton
+    chunking.py         Transcript chunking
+    utils_unified.py    Video-id extraction from URLs
+    routers/
+      ingest.py         Ingest endpoints and job queue
+      search.py         Search and retrieval logic
+      videos.py         Library management endpoints
     requirements.txt
-    data/             Runtime artifacts (media, frames, indexes, sqlite)
-  frontend/           Vite + React UI (work in progress)
-  extension/          Browser extension (placeholder)
-  README.md
+    data/               Runtime artifacts — see Data layout below
+  frontend/             Vite + React UI
 ```
 
 ## Requirements
 
-- Python 3.10 or newer
-- `ffmpeg` and `ffprobe` on PATH
-- `yt-dlp` (installed by `requirements.txt`)
-- Optional GPU: CUDA for Florence-2 and OWLv2 will be used automatically when available
+- Python 3.10+
+- `ffmpeg` and `ffprobe` on `PATH`
+- Apple Silicon (MPS) or CUDA recommended; CPU-only is supported but slow
 
-## Installation
+## Setup
 
 ```bash
 cd backend
 pip install -r requirements.txt
+python -m spacy download en_core_web_sm
 ```
 
-## Running the API
+## Running
 
 ```bash
 cd backend
 uvicorn app:app --reload --port 8000
 ```
 
-Wait for the log line `Application startup complete` before issuing requests. Model weights are downloaded on first use, so the initial ingest can take several minutes.
+The server pre-warms X-CLIP and the sentence encoder on startup. Model weights are downloaded on first use; the initial ingest takes a few minutes.
+
+Start the UI in a separate terminal:
+
+```bash
+cd frontend
+npm install && npm run dev
+```
 
 ## Ingestion
 
-Download, transcribe, sample frames, caption, and build all indexes in one call:
+### YouTube / remote URL
 
 ```bash
-curl -X POST http://127.0.0.1:8000/ingest \
-  -H "Content-Type: application/json" \
+curl -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
   -d '{"video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 ```
 
-The pipeline:
-
-1. `yt-dlp` downloads the video to `data/media/<video_id>.mp4`.
-2. `ffmpeg` extracts audio to `data/media/<video_id>.wav`.
-3. Whisper produces a transcript; chunks are embedded and written to `data/indexes/<video_id>.faiss`.
-4. `ffmpeg` samples one frame per second into `data/frames/<video_id>/`.
-5. Florence-2 produces a detailed caption and object labels for each frame.
-6. Captions are embedded with `bge-small` and written to `<video_id>.vfaiss`.
-7. Sliding windows over caption embeddings produce action clips in `<video_id>.aclip.faiss`.
-8. A summary context vector is built for cross-video filtering.
-
-List ingested videos and their available indexes:
+### Local file
 
 ```bash
-curl http://127.0.0.1:8000/videos
+curl -X POST http://localhost:8000/ingest/upload \
+  -F 'file=@/path/to/video.mp4'
 ```
 
-## Unified Query Endpoint
+Both return a `job_id`. Poll for completion:
 
-All searches go through `POST /query` with a mode and scope.
+```bash
+curl http://localhost:8000/ingest/status/<job_id>
+```
+
+`status` is one of `queued`, `running`, `done`, `error`. The `stage` field gives a progress description. Only one ingest runs at a time; submitting while one is active returns HTTP 409.
+
+Ingest runs as a subprocess so Florence-2 and YOLOv8 live in a separate process from the search server, avoiding shared-MPS memory pressure on Apple Silicon.
+
+## Search
+
+All searches go through `POST /query`.
+
+### Request fields
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `mode` | `text` \| `visual` \| `action` \| `auto` | required | |
+| `scope` | `video` \| `global` | `video` | |
+| `query` | string | required | Natural-language query |
+| `k` | int | 50 | Max results (capped at 200) |
+| `video_url` | string | — | Required when `scope=video` unless `video_id` given |
+| `video_id` | string | — | Extracted from URL when absent |
+| `filter_objects` | string | — | Keep only hits whose YOLO labels contain this string |
+| `videos` | string[] | — | Restrict `global` scope to these video IDs |
 
 ### Modes
 
-- `text` — semantic search over transcript chunks.
-- `visual` — frame-level search over caption embeddings.
-- `action` — segment-level search over sliding windows of captions.
-- `action_chain` — ordered sequence of action queries with a maximum inter-step gap.
+**`text`** — semantic search over Whisper transcript chunks.
 
-### Scopes
+**`visual`** — frame-level cosine similarity using SigLIP embeddings. Best for static scenes, objects, and appearances.
 
-- `video` (default) — restrict to one video via `video_id` or `video_url`.
-- `global` — search across all ingested videos; optionally restrict with `videos: [...]`.
+**`action`** — clip-level similarity using X-CLIP embeddings over 4-second sliding windows. Best for activities and motion.
 
-### Text search
+**`auto`** — runs all three plus direct YOLO object-label matching, then merges and deduplicates. Use this by default.
+
+### Examples
 
 ```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "mode":"text",
-    "query":"chorus",
-    "k":5
-  }'
+# Transcript search
+curl -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{"video_id":"dQw4w9WgXcQ","mode":"text","query":"the chorus","k":5}'
+
+# Visual search across all indexed videos
+curl -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"global","mode":"visual","query":"chef with a knife","k":10}'
+
+# Auto search on a single video
+curl -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{"video_id":"zPxQjuFoUBc","mode":"auto","query":"knife","k":10}'
+
+# Action search filtered to frames containing a person
+curl -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{"video_id":"zPxQjuFoUBc","mode":"action","query":"chopping","filter_objects":"person","k":20}'
 ```
 
-### Visual search
+### Response
 
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://youtu.be/zPxQjuFoUBc",
-    "mode":"visual",
-    "query":"chef chopping meat on a board",
-    "filter_objects":"person",
-    "verify_with_gdino": true,
-    "verify_prompts": ["chef","knife","cutting board"],
-    "k":12
-  }'
+```json
+{
+  "video_id": "zPxQjuFoUBc",
+  "mode": "auto",
+  "score_range": {"min": 0.28, "max": 0.58},
+  "hits": [
+    {
+      "video_id": "zPxQjuFoUBc",
+      "start": 42.1,
+      "end": 44.3,
+      "score": 0.577,
+      "frame": "frames/zPxQjuFoUBc/frame-001234.jpg",
+      "objects": ["knife", "person", "cutting board"],
+      "caption": "A chef slicing meat on a wooden cutting board.",
+      "text": null
+    }
+  ]
+}
 ```
 
-When `verify_with_gdino` is true, hits are reranked by checking whether Florence-2 captions contain the `verify_prompts` terms. No extra detector inference is required at query time; the reranker reuses the captions stored at ingest time.
+`frame` paths are served by the API under `/frames/`.
 
-### Action search
+## Other endpoints
 
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://youtu.be/zPxQjuFoUBc",
-    "mode":"action",
-    "query":"chopping meat",
-    "k":40
-  }'
-```
+| Method | Path | Description |
+|---|---|---|
+| GET | `/videos` | List indexed videos with metadata and top object labels |
+| DELETE | `/videos/{video_id}` | Remove a video and all its indexes |
+| POST | `/build_contexts` | Rebuild per-video context vectors (after manual DB edits) |
 
-### Action-chain search
-
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "video_url":"https://youtu.be/zPxQjuFoUBc",
-    "mode":"action_chain",
-    "steps":["open fridge","take meat","chop meat"],
-    "max_gap":8.0,
-    "k":50
-  }'
-```
-
-Parameters:
-- `steps` — ordered list of action prompts.
-- `max_gap` — maximum seconds between the end of one matched clip and the start of the next.
-
-### Global scope
-
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scope":"global",
-    "mode":"action",
-    "query":"cooking",
-    "k":20
-  }'
-```
-
-## Auxiliary Endpoints
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET  | `/search`           | Legacy text search for a single video. |
-| GET  | `/vsearch`          | Legacy frame-level visual search. |
-| GET  | `/asearch`          | Legacy action-clip search for a single video. |
-| GET  | `/asearch_chain`    | Legacy action-chain search. |
-| GET  | `/asearch_all`      | Action search across all indexed videos. |
-| GET  | `/videos`           | List ingested videos and available indexes. |
-| POST | `/ingest`           | Run the ingestion pipeline for a video. |
-| POST | `/build_contexts`   | Rebuild per-video context vectors used by the global scope. |
-| POST | `/ov_verify`        | Run OWLv2 detection on specified frames for ad-hoc verification. |
-
-Static file mounts:
-- `/frames/<video_id>/...` serves sampled frames.
-- `/media/<video_id>.mp4` serves source media.
-
-## Request Models
-
-The primary request body, `UnifiedSearchRequest`:
-
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `video_url` | string | — | Required for scope `video` unless `video_id` given. |
-| `video_id` | string | — | Derived from URL when absent. |
-| `query` | string | — | Required for `text`, `visual`, `action`. |
-| `mode` | `text` \| `visual` \| `action` \| `action_chain` | — | |
-| `k` | int | 50 | Top-k after deduping and NMS. |
-| `filter_objects` | string | null | Keep hits whose object labels contain this string. |
-| `steps` | string[] | null | Required for `action_chain`. |
-| `max_gap` | float | 8.0 | Inter-step gap in seconds for `action_chain`. |
-| `ingest_if_needed` | bool | true | Auto-ingest when indexes are missing. |
-| `scope` | `video` \| `global` | `video` | |
-| `videos` | string[] | null | Restrict global scope to these video_ids. |
-| `verify_with_gdino` | bool | false | Enable caption-based verification rerank. |
-| `verify_prompts` | string[] | null | Terms sought in captions. |
-| `verify_require_all` | string[] | null | Hard-required terms for the rerank. |
-
-## Data Layout
+## Data layout
 
 ```
 backend/data/
-  media/      <video_id>.mp4, <video_id>.wav
-  frames/     <video_id>/frame-XXXXXX.jpg
-  indexes/    <video_id>.faiss         text
-              <video_id>.vfaiss        visual (caption embeddings)
-              <video_id>.aclip.faiss   action clips
-              meta.sqlite              rows, captions, object labels, context
-  transcripts/<video_id>.json
+  media/     <video_id>.mp4   <video_id>.wav
+  frames/    <video_id>/frame-*.jpg
+  indexes/   <video_id>.faiss           transcript (BGE)
+             <video_id>.svfaiss         frames (SigLIP)
+             <video_id>.xaclip.faiss    clips (X-CLIP)
+             meta.sqlite                chunks, captions, objects, context vectors
+  jobs/      <job_id>.json              ingest job status
 ```
 
-To reset the service, stop the server and remove everything under `backend/data/` except the directory itself.
+To fully reset, stop the server and delete `backend/data/`. To remove a single video, use `DELETE /videos/{video_id}` or remove its three index files and run `DELETE /videos/{video_id}` to clean the DB rows.
+
+## Design notes
+
+**Prompt ensembling.** The search vector is the mean of embeddings for four phrasings of the query (`{}`, `a photo of {}`, `a video of {}`, `close-up of {}`). This improves recall for short queries without requiring query expansion heuristics.
+
+**Evidence filter.** In `auto` mode, when YOLO finds no object match for a query in a given video, FAISS hits must have Florence-2 caption or object-label corroboration to be returned. Hits with no caption evidence require an X-CLIP score above 0.50 to pass. This prevents unrelated videos from appearing via embedding drift alone.
+
+**Process isolation.** Each ingest job runs as a subprocess via `ingest_worker.py`. Florence-2 and YOLOv8 (ingest-time models) and X-CLIP + BGE (search-time models) never share an MPS process pool, which prevents OOM crashes on Apple Silicon.

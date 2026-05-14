@@ -1,4 +1,3 @@
-# backend/routers/videos.py
 import os, json, logging
 from fastapi import APIRouter, HTTPException, Path
 from typing import Optional, List
@@ -44,7 +43,6 @@ async def list_videos():
             has_visual    = os.path.exists(os.path.join(_indexes_dir, f"{vid}.svfaiss"))
             has_xclip     = os.path.exists(os.path.join(_indexes_dir, f"{vid}.xaclip.faiss"))
             has_action    = has_xclip or os.path.exists(os.path.join(_indexes_dir, f"{vid}.saclip.faiss"))
-            # Fetch title, source_url, top_objects from video_context
             title, source_url, top_objects = None, None, []
             with db() as conn:
                 row = conn.execute(

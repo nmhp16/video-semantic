@@ -1,4 +1,3 @@
-# backend/routers/search.py
 import os, json, logging, re
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
@@ -22,7 +21,6 @@ BASE = os.path.dirname(os.path.dirname(__file__))
 _indexes_dir = os.path.join(BASE, "data", "indexes")
 _frames_dir  = os.path.join(BASE, "data", "frames")
 
-# SigLIP encoder — lazy, for visual (frame-level) queries
 _SIGLIP = None
 def _get_siglip():
     global _SIGLIP
@@ -32,13 +30,11 @@ def _get_siglip():
     return _SIGLIP
 
 def _build_siglip_query_vector(q: str):
-    """Encode query text with SigLIP — matches the visual (frame-level) index."""
     import numpy as np
-    vec = _get_siglip().encode_text([q])   # (1, 768), already L2-normalised
+    vec = _get_siglip().encode_text([q])
     return vec.reshape(1, -1).astype("float32")
 
 
-# X-CLIP encoder — lazy, for action (temporal clip) queries
 _XCLIP = None
 def _get_xclip():
     global _XCLIP
@@ -48,7 +44,7 @@ def _get_xclip():
     return _XCLIP
 
 
-# Prompt templates for ensembling — averaging their embeddings gives better recall
+# Four phrasings averaged together — improves recall for short queries
 _QUERY_TEMPLATES = [
     "{}",
     "a photo of {}",
@@ -57,11 +53,10 @@ _QUERY_TEMPLATES = [
 ]
 
 def _build_query_vector(q: str):
-    """Batch-encode query with X-CLIP (multiple phrasings, mean-pooled) — matches action index."""
     import numpy as np
     enc = _get_xclip()
     prompts = [t.format(q) for t in _QUERY_TEMPLATES]
-    vecs = enc.encode_text(prompts)          # (N, D), already L2-normalised
+    vecs = enc.encode_text(prompts)
     mean = vecs.mean(axis=0)
     return (mean / (np.linalg.norm(mean) + 1e-12)).reshape(1, -1).astype("float32")
 
@@ -180,22 +175,19 @@ def _score_range(hits: list) -> ScoreRange:
     return ScoreRange(min=min(scores), max=max(scores))
 
 
-# Minimum cosine similarity for visual/action hits — anything below is noise.
-# X-CLIP good matches are typically 0.25–0.45; below 0.18 is essentially random.
-_VISUAL_MIN_SCORE: float = 0.18
+_VISUAL_MIN_SCORE: float = 0.18  # below this, X-CLIP scores are noise
 
 _STOPWORDS = {"a","an","the","is","are","was","were","in","on","at","of","and","or",
               "to","with","for","this","that","it","its","be","by","as","from"}
 
 def _caption_evidence_filter(hits: list, q: str,
                              strict_min: float = 0.50) -> list:
-    """Keep only hits with per-hit caption/object evidence for the query.
+    """Keep only hits whose caption/objects mention a query token.
 
-    When YOLO found nothing in a video, X-CLIP scores alone are unreliable —
-    prompt ensembling can push irrelevant frames (e.g. music videos) above 0.45.
-    We require actual caption or object-label evidence per hit.
-    Fallback: if no hit has evidence, keep hits scoring >= strict_min (very high
-    bar, only truly exceptional X-CLIP confidence passes without corroboration).
+    Called when YOLO found no object match for the query in a video. Without
+    caption corroboration, prompt-ensembled X-CLIP scores are unreliable —
+    irrelevant videos can score above 0.45 for short queries like "knife".
+    Fallback: when no hit has caption evidence, admit hits at strict_min (0.50+).
     """
     if not hits or not q:
         return hits
@@ -234,11 +226,9 @@ def _caption_rerank(hits: list, q: str, boost: float = 0.10) -> list:
 
 
 def _search_by_objects(video_id: str, q: str) -> list:
-    """Return frames where any YOLO/caption object exactly matches a query token.
+    """Return frames where YOLO detected an object matching a query token.
 
-    Complements X-CLIP: catches cases where the model detected the right object
-    (e.g. knife) but the frame's visual embedding didn't score above threshold.
-    Score is fixed at 0.30 — above noise floor, below a strong X-CLIP match.
+    Score fixed at 0.30 — above the noise floor, below a strong X-CLIP match.
     """
     tokens = {t for t in re.sub(r"[^a-z0-9 ]", " ", q.lower()).split()
               if t and t not in _STOPWORDS and len(t) > 1}
@@ -268,11 +258,10 @@ def _search_by_objects(video_id: str, q: str) -> list:
 
 def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[str],
                        qv=None, vis_qv=None) -> list:
-    """Run visual + action + text + object-match searches and merge results."""
     if qv is None:
-        qv = _build_query_vector(q)        # X-CLIP for action
+        qv = _build_query_vector(q)
     if vis_qv is None:
-        vis_qv = _build_siglip_query_vector(q)  # SigLIP for visual frames
+        vis_qv = _build_siglip_query_vector(q)
     vis_hits: list = []
     act_hits: list = []
     txt_hits: list = []
@@ -304,7 +293,6 @@ def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[s
 
 
 def _all_vids_with_visual_chunks(restrict: Optional[list]) -> list:
-    """All video_ids that have visual_chunks rows in the DB."""
     from db import db
     with db() as conn:
         rows = conn.execute("SELECT DISTINCT video_id FROM visual_chunks").fetchall()
@@ -318,8 +306,7 @@ def search_auto_global(q: str, k: int, filter_objects=None, restrict_videos=None
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
     # FAISS search: only videos that passed context filter (or all indexed if no filter hit)
     faiss_vids = set(candidates) if candidates else (vis_vids | act_vids)
-    # Build query vectors once — reused across all videos in the loop
-    qv = _build_query_vector(q)            # X-CLIP for action clips
+    qv = _build_query_vector(q)             # X-CLIP for action clips
     vis_qv = _build_siglip_query_vector(q)  # SigLIP for visual frames
     all_hits: list = []
     for vid in faiss_vids:
@@ -327,10 +314,10 @@ def search_auto_global(q: str, k: int, filter_objects=None, restrict_videos=None
             all_hits.extend(search_auto_single(vid, q, k, filter_objects, qv=qv, vis_qv=vis_qv))
         except Exception:
             logger.warning("auto global skipped %s", vid, exc_info=True)
-    # Object-match search: all videos in DB, not gated by context filter
+    # Object-match on all DB videos, not gated by context filter
     for vid in _all_vids_with_visual_chunks(restrict_videos):
         if vid in faiss_vids:
-            continue  # search_auto_single already ran _search_by_objects for this vid
+            continue
         try:
             all_hits.extend(_search_by_objects(vid, q))
         except Exception:
@@ -475,10 +462,6 @@ def search_action_global(q: str, k: int, filter_objects=None, restrict_videos=No
 
 
 
-# ── Caption enrichment (called by frontend after results render) ──
-
-
-
 
 @router.get("/asearch_all")
 def asearch_all(q: str = Query(...), k: int = Query(50, ge=1, le=MAX_K),
@@ -491,8 +474,6 @@ def asearch_all(q: str = Query(...), k: int = Query(50, ge=1, le=MAX_K),
         logger.exception("/asearch_all failed")
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
-
-# ── Unified /query ──
 
 @router.post("/query", response_model=UnifiedSearchResponse)
 def unified_query(body: UnifiedSearchRequest):

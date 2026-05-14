@@ -1,4 +1,3 @@
-# backend/db.py
 import os, sqlite3, json, shutil, logging
 from contextlib import contextmanager
 from typing import Optional, Dict, List
@@ -11,7 +10,6 @@ DB_PATH = os.path.join(DATA, "indexes", "meta.sqlite")
 
 
 def init_db() -> None:
-    """Run once at app startup — creates tables, migrations, and column indexes."""
     os.makedirs(os.path.join(DATA, "indexes"), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -61,7 +59,6 @@ def init_db() -> None:
         )
     """)
 
-    # Performance indexes (idempotent)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_video ON chunks(video_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_visual_chunks_video ON visual_chunks(video_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_visual_clips_video ON visual_clips(video_id)")

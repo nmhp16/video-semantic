@@ -1,4 +1,3 @@
-# backend/indexes.py
 import os, json, faiss, numpy as np, logging
 from collections import OrderedDict
 from threading import Lock
@@ -14,7 +13,6 @@ SVINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.svfaiss")
 SACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.saclip.faiss")
 XACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.xaclip.faiss")
 
-# Thread-safe LRU cache for FAISS index objects
 _cache: OrderedDict = OrderedDict()
 _CACHE_MAX = 50
 _lock = Lock()

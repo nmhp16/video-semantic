@@ -1,4 +1,3 @@
-# backend/routers/ingest.py
 import os, uuid, time, logging, json, re, shutil, queue, threading, subprocess, sys
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -120,9 +119,8 @@ def _run_ingest_proc(status_file: str, url: str, video_id: str):
             except Exception:
                 pass
 
-        # Visual and audio pipelines are independent — run them in parallel.
-        # Audio thread waits for the .wav (written by visual in its first ~20s)
-        # before starting Whisper, avoiding any ffmpeg race on the same file.
+        # Audio waits for the .wav written by the visual pipeline to avoid
+        # an ffmpeg race — visual writes the wav file in its first ~20 s.
         import threading
         _media_dir = _os.path.join(_backend, "data", "media")
         wav_path = _os.path.join(_media_dir, f"{video_id}.wav")
