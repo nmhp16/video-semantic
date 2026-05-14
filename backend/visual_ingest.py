@@ -142,6 +142,47 @@ def _caption_keywords(caption: str) -> List[str]:
     words = (w.lower() for w in _WORD_RE.findall(caption))
     return sorted({w for w in words if w not in _STOPWORDS})
 
+# --- SigLIP vision-text encoder for frame-level visual search ---
+class SigLIPEncoder:
+    def __init__(self, model_id: str = "google/siglip-base-patch16-224"):
+        from transformers import SiglipModel, SiglipProcessor
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif torch.backends.mps.is_available():
+            self._device = "mps"
+        else:
+            self._device = "cpu"
+        self.model = SiglipModel.from_pretrained(model_id).to(self._device).eval()
+        self.processor = SiglipProcessor.from_pretrained(model_id)
+
+    def encode_image_paths(self, paths: List[str], batch_size: int = 16) -> np.ndarray:
+        total = len(paths)
+        results = []
+        for i in range(0, total, batch_size):
+            batch_paths = paths[i:i + batch_size]
+            imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+            try:
+                inputs = self.processor(images=imgs, return_tensors="pt",
+                                        padding="max_length").to(self._device)
+                with torch.no_grad():
+                    feats = self.model.get_image_features(**inputs)
+                feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                results.append(feats.float().cpu().numpy())
+            finally:
+                for img in imgs:
+                    img.close()
+            print(f"  siglip {min(i + batch_size, total)}/{total} frames")
+        return np.concatenate(results, axis=0).astype("float32")
+
+    def encode_text(self, texts: List[str]) -> np.ndarray:
+        inputs = self.processor(text=texts, return_tensors="pt",
+                                padding="max_length").to(self._device)
+        with torch.no_grad():
+            feats = self.model.get_text_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        return feats.float().cpu().numpy().astype("float32")
+
+
 # --- X-CLIP video-language encoder for action search ---
 class XCLIPEncoder:
     N_FRAMES = 8
@@ -310,6 +351,7 @@ class YOLODetector:
 
 # Module-level singletons — kept warm between jobs in the persistent worker process.
 _captioner_instance: "Florence2Captioner | None" = None
+_siglip_instance: "SigLIPEncoder | None" = None
 _xclip_instance: "XCLIPEncoder | None" = None
 _yolo_instance: "YOLODetector | None" = None
 
@@ -319,6 +361,13 @@ def _get_captioner() -> Florence2Captioner:
     if _captioner_instance is None:
         _captioner_instance = Florence2Captioner()
     return _captioner_instance
+
+
+def _get_siglip() -> SigLIPEncoder:
+    global _siglip_instance
+    if _siglip_instance is None:
+        _siglip_instance = SigLIPEncoder()
+    return _siglip_instance
 
 
 def _get_xclip() -> XCLIPEncoder:
@@ -372,11 +421,11 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
     if progress_cb: progress_cb("Extracting frames…")
     frames = sample_frames(src, out_dir, max_gap_sec=max_gap_sec, scene_thresh=scene_thresh)
 
-    # X-CLIP frame embeddings — reuse singleton (no reload between jobs)
-    if progress_cb: progress_cb(f"Encoding {len(frames)} frames (X-CLIP)…")
-    xclip = _get_xclip()
-    print(f"X-CLIP encoding {len(frames)} frames...")
-    frame_embs = xclip.encode_frames_batch([f["path"] for f in frames], batch_size=8)
+    # SigLIP frame embeddings — image-text contrastive space, better for per-frame visual search
+    if progress_cb: progress_cb(f"Encoding {len(frames)} frames (SigLIP)…")
+    siglip = _get_siglip()
+    print(f"SigLIP encoding {len(frames)} frames...")
+    frame_embs = siglip.encode_image_paths([f["path"] for f in frames], batch_size=16)
 
     # Resumable caption checkpoint — skip frames already captioned on a prior run.
     _ckpt_dir = os.path.join(DATA, "checkpoints")

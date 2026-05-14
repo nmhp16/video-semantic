@@ -36,7 +36,15 @@ def _worker_loop():
             break
         status_file, url, video_id = item
         wlog.info("Starting job: %s", video_id)
-        env = {**os.environ, "PYTHONPATH": BASE}
+        env = {
+            **os.environ,
+            "PYTHONPATH": BASE,
+            # Required on macOS — prevents numpy RecursionError on fork
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES",
+        }
         proc = subprocess.Popen(
             [sys.executable, _WORKER_SCRIPT, status_file, url, video_id],
             cwd=BASE, env=env,

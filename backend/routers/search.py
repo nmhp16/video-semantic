@@ -22,7 +22,23 @@ BASE = os.path.dirname(os.path.dirname(__file__))
 _indexes_dir = os.path.join(BASE, "data", "indexes")
 _frames_dir  = os.path.join(BASE, "data", "frames")
 
-# X-CLIP encoder — lazy
+# SigLIP encoder — lazy, for visual (frame-level) queries
+_SIGLIP = None
+def _get_siglip():
+    global _SIGLIP
+    if _SIGLIP is None:
+        from visual_ingest import SigLIPEncoder
+        _SIGLIP = SigLIPEncoder()
+    return _SIGLIP
+
+def _build_siglip_query_vector(q: str):
+    """Encode query text with SigLIP — matches the visual (frame-level) index."""
+    import numpy as np
+    vec = _get_siglip().encode_text([q])   # (1, 768), already L2-normalised
+    return vec.reshape(1, -1).astype("float32")
+
+
+# X-CLIP encoder — lazy, for action (temporal clip) queries
 _XCLIP = None
 def _get_xclip():
     global _XCLIP
@@ -41,7 +57,7 @@ _QUERY_TEMPLATES = [
 ]
 
 def _build_query_vector(q: str):
-    """Batch-encode query with multiple phrasings and return mean-pooled vector."""
+    """Batch-encode query with X-CLIP (multiple phrasings, mean-pooled) — matches action index."""
     import numpy as np
     enc = _get_xclip()
     prompts = [t.format(q) for t in _QUERY_TEMPLATES]
@@ -250,15 +266,18 @@ def _search_by_objects(video_id: str, q: str) -> list:
     return hits
 
 
-def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[str], qv=None) -> list:
+def search_auto_single(video_id: str, q: str, k: int, filter_objects: Optional[str],
+                       qv=None, vis_qv=None) -> list:
     """Run visual + action + text + object-match searches and merge results."""
     if qv is None:
-        qv = _build_query_vector(q)
+        qv = _build_query_vector(q)        # X-CLIP for action
+    if vis_qv is None:
+        vis_qv = _build_siglip_query_vector(q)  # SigLIP for visual frames
     vis_hits: list = []
     act_hits: list = []
     txt_hits: list = []
     try:
-        vis_hits = search_visual_single(video_id, q, k * 2, filter_objects, qv=qv)
+        vis_hits = search_visual_single(video_id, q, k * 2, filter_objects, qv=vis_qv)
     except FileNotFoundError:
         pass
     try:
@@ -299,12 +318,13 @@ def search_auto_global(q: str, k: int, filter_objects=None, restrict_videos=None
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
     # FAISS search: only videos that passed context filter (or all indexed if no filter hit)
     faiss_vids = set(candidates) if candidates else (vis_vids | act_vids)
-    # Build ensemble query vector once for all FAISS searches
-    qv = _build_query_vector(q)
+    # Build query vectors once — reused across all videos in the loop
+    qv = _build_query_vector(q)            # X-CLIP for action clips
+    vis_qv = _build_siglip_query_vector(q)  # SigLIP for visual frames
     all_hits: list = []
     for vid in faiss_vids:
         try:
-            all_hits.extend(search_auto_single(vid, q, k, filter_objects, qv=qv))
+            all_hits.extend(search_auto_single(vid, q, k, filter_objects, qv=qv, vis_qv=vis_qv))
         except Exception:
             logger.warning("auto global skipped %s", vid, exc_info=True)
     # Object-match search: all videos in DB, not gated by context filter
@@ -378,7 +398,7 @@ def search_text_single(video_id: str, q: str, k: int) -> list:
 def search_visual_single(video_id: str, q: str, k: int, filter_objects: Optional[str], qv=None) -> list:
     index, rows = load_siglip_visual_index(video_id)
     if qv is None:
-        qv = _build_query_vector(q)
+        qv = _build_siglip_query_vector(q)
     D, I = index.search(qv, k)
     out = []
     for s, idx in zip(D[0].tolist(), I[0].tolist()):
@@ -427,7 +447,7 @@ def search_text_global(q: str, k: int, restrict_videos=None) -> list:
 def search_visual_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
     candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
     vids = candidates if candidates else _globally(".svfaiss", restrict_videos)
-    qv = _build_query_vector(q)
+    qv = _build_siglip_query_vector(q)
     all_hits = []
     for vid in vids:
         try:
