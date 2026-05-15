@@ -136,7 +136,7 @@ def _run_ingest_proc(status_file: str, url: str, video_id: str):
 
         def _run_visual():
             try:
-                from visual_ingest import ingest_visual
+                from vision import ingest_visual
                 _write_status(status_file, "running", "Downloading & extracting frames…")
                 ingest_visual(url, progress_cb=lambda s: _write_status(status_file, "running", s))
             except Exception as e:
@@ -148,7 +148,7 @@ def _run_ingest_proc(status_file: str, url: str, video_id: str):
                 deadline = _time.monotonic() + _WAV_WAIT_TIMEOUT
                 while not _os.path.exists(wav_path) and _time.monotonic() < deadline:
                     _time.sleep(1)
-                from pipeline import pipeline
+                from pipeline import ingest
                 ingest(url)
             except Exception as e:
                 audio_exc.append(e)

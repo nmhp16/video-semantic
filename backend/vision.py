@@ -1,19 +1,28 @@
-import os, subprocess, json
-from typing import List, Dict
-from PIL import Image
+import json
+import logging
+import os
+import re
+import subprocess
+from pathlib import Path
+from typing import Dict, List
+
 import numpy as np
 import torch
+from PIL import Image
 from transformers import AutoModelForCausalLM
+
+from db import put_cached_captions
+from pipeline import extract_audio
 from store import (
     DATA,
-    save_visual_metadata, save_action_clips_metadata,
-    save_siglip_visual_index, save_xclip_action_index,
+    save_action_clips_metadata,
+    save_siglip_visual_index,
+    save_visual_metadata,
+    save_xclip_action_index,
 )
-from db import put_cached_captions
-import re
-from pathlib import Path
-from pipeline import extract_audio
 from utils import YT_ID_RE
+
+logger = logging.getLogger(__name__)
 
 MEDIA = os.path.join(DATA, "media")
 FRAMES = os.path.join(DATA, "frames")
@@ -173,7 +182,7 @@ class SigLIPEncoder:
             finally:
                 for img in imgs:
                     img.close()
-            print(f"  siglip {min(i + batch_size, total)}/{total} frames")
+            logger.info(f"  siglip {min(i + batch_size, total)}/{total} frames")
         return np.concatenate(results, axis=0).astype("float32")
 
     def encode_text(self, texts: List[str]) -> np.ndarray:
@@ -274,7 +283,7 @@ class XCLIPEncoder:
             feats = out.video_embeds                               # (B, dim)
             feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             results.append(feats.float().cpu().numpy())
-            print(f"  xclip frames {min(i + batch_size, total)}/{total}")
+            logger.info(f"  xclip frames {min(i + batch_size, total)}/{total}")
         return np.concatenate(results, axis=0).astype("float32")
 
 
@@ -464,7 +473,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
     # SigLIP frame embeddings — image-text contrastive space, better for per-frame visual search
     if progress_cb: progress_cb(f"Encoding {len(frames)} frames (SigLIP)…")
     siglip = _get_siglip()
-    print(f"SigLIP encoding {len(frames)} frames...")
+    logger.info(f"SigLIP encoding {len(frames)} frames...")
     frame_embs = siglip.encode_image_paths([f["path"] for f in frames], batch_size=16)
 
     # Resumable caption checkpoint — skip frames already captioned on a prior run.
@@ -476,7 +485,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
         try:
             with open(_ckpt_path) as _f:
                 scene_captions = {int(k): v for k, v in json.load(_f).items()}
-            print(f"Resuming from checkpoint: {len(scene_captions)} captions already done")
+            logger.info(f"Resuming from checkpoint: {len(scene_captions)} captions already done")
         except Exception:
             scene_captions = {}
 
@@ -488,7 +497,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
         already_done = total_scene - len(remaining)
         captioner = _get_captioner()
         if progress_cb: progress_cb(f"Captioning {already_done}/{total_scene} scene frames (Moondream2)…")
-        print(f"Moondream2 captioning {len(remaining)}/{total_scene} scene-change frames...")
+        logger.info(f"Moondream2 captioning {len(remaining)}/{total_scene} scene-change frames...")
         for rank, idx in enumerate(remaining):
             img = Image.open(frames[idx]["path"]).convert("RGB")
             scene_captions[idx] = captioner.caption_batch([img])[0]
@@ -496,7 +505,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
             done = already_done + rank + 1
             if progress_cb: progress_cb(f"Captioning {done}/{total_scene} scene frames (Moondream2)…")
             if (rank + 1) % 5 == 0 or rank + 1 == len(remaining):
-                print(f"  captioned {done}/{total_scene} scene frames")
+                logger.info(f"  captioned {done}/{total_scene} scene frames")
                 import tempfile
                 _ckpt_dir_tmp = os.path.dirname(_ckpt_path)
                 with tempfile.NamedTemporaryFile("w", delete=False, dir=_ckpt_dir_tmp, suffix=".tmp") as _tf:
@@ -504,7 +513,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
                     _tmp_path = _tf.name
                 os.replace(_tmp_path, _ckpt_path)
     else:
-        print(f"All {total_scene} scene captions loaded from checkpoint")
+        logger.info(f"All {total_scene} scene captions loaded from checkpoint")
 
     # Propagate scene captions to gap-fill frames (forward-fill)
     captions_data: List[Dict] = []
@@ -518,7 +527,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
     # Each frame takes ~50ms so this adds only a few seconds total.
     # YOLO provides a second, calibrated pass — fills gaps where the caption model is imprecise.
     if progress_cb: progress_cb("Detecting objects (YOLO)…")
-    print(f"YOLO detecting objects on {len(frames)} frames…")
+    logger.info(f"YOLO detecting objects on {len(frames)} frames…")
     yolo = _get_yolo()
     for i, f in enumerate(frames):
         detected = yolo.detect(f["path"])
@@ -529,18 +538,18 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
 
     frame_rel = [os.path.relpath(f["path"], start=os.path.dirname(DATA)) for f in frames]
     put_cached_captions(video_id, {k: v for k, v in zip(frame_rel, captions_data)})
-    print(f"Cached {len(captions_data)} captions for {video_id}")
+    logger.info(f"Cached {len(captions_data)} captions for {video_id}")
 
     # Action clips: X-CLIP sliding windows — reuse singleton
     if progress_cb: progress_cb("Encoding action clips (X-CLIP)…")
     xclip = _get_xclip()
-    print(f"X-CLIP encoding action clips for {video_id}...")
+    logger.info(f"X-CLIP encoding action clips for {video_id}...")
     xclip_clip_vecs, clip_rows = build_xclip_clips(
         frames, xclip, captions_data=captions_data, clip_len=4.0, stride=2.0
     )
     save_xclip_action_index(video_id, xclip_clip_vecs)
     save_action_clips_metadata(video_id, clip_rows)
-    print(f"ACTION CLIPS OK: {video_id} | clips={len(xclip_clip_vecs)}")
+    logger.info(f"ACTION CLIPS OK: {video_id} | clips={len(xclip_clip_vecs)}")
 
     rows = []
     for i, f in enumerate(frames):
@@ -558,7 +567,7 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
         os.remove(_ckpt_path)
     except FileNotFoundError:
         pass
-    print(f"INGEST OK: {video_id} | frames={len(frames)}")
+    logger.info(f"INGEST OK: {video_id} | frames={len(frames)}")
 
 if __name__ == "__main__":
     import sys, os

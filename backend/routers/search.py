@@ -28,7 +28,7 @@ def _get_siglip():
     if _SIGLIP is None:
         with _siglip_lock:
             if _SIGLIP is None:
-                from visual_ingest import SigLIPEncoder
+                from vision import SigLIPEncoder
                 _SIGLIP = SigLIPEncoder()
     return _SIGLIP
 
@@ -44,7 +44,7 @@ def _get_xclip():
     if _XCLIP is None:
         with _xclip_lock:
             if _XCLIP is None:
-                from visual_ingest import XCLIPEncoder
+                from vision import XCLIPEncoder
                 _XCLIP = XCLIPEncoder()
     return _XCLIP
 
@@ -500,7 +500,7 @@ def unified_query(body: UnifiedSearchRequest):
             need_auto=body.mode == "auto",
         ):
             from pipeline import ingest as do_ingest
-            from visual_ingest import ingest_visual as do_visual
+            from vision import ingest_visual as do_visual
             if body.mode == "text":
                 do_ingest(body.video_url or "")
             else:
