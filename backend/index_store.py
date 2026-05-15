@@ -1,5 +1,4 @@
 import os, json, faiss, numpy as np, logging
-from collections import OrderedDict
 from threading import Lock
 from typing import List
 
@@ -8,12 +7,13 @@ logger = logging.getLogger(__name__)
 BASE = os.path.dirname(__file__)
 DATA = os.path.join(BASE, "data")
 
-INDEX_PATH   = lambda vid: os.path.join(DATA, "indexes", f"{vid}.faiss")
-SVINDEX_PATH = lambda vid: os.path.join(DATA, "indexes", f"{vid}.svfaiss")
-SACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.saclip.faiss")
-XACLIP_PATH  = lambda vid: os.path.join(DATA, "indexes", f"{vid}.xaclip.faiss")
+def INDEX_PATH(vid):   return os.path.join(DATA, "indexes", f"{vid}.faiss")
+def SVINDEX_PATH(vid): return os.path.join(DATA, "indexes", f"{vid}.svfaiss")
+def SACLIP_PATH(vid):  return os.path.join(DATA, "indexes", f"{vid}.saclip.faiss")
+def XACLIP_PATH(vid):  return os.path.join(DATA, "indexes", f"{vid}.xaclip.faiss")
 
-_cache: OrderedDict = OrderedDict()
+_NORM_EPS = 1e-12
+_cache: dict = {}
 _CACHE_MAX = 50
 _lock = Lock()
 
@@ -46,10 +46,10 @@ def _save_ip_index(path: str, embeddings: np.ndarray):
         try:
             if faiss.read_index(path).d != d:
                 os.remove(path)
-        except Exception:
+        except (OSError, RuntimeError):
             os.remove(path)
     index = faiss.IndexFlatIP(d)
-    vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
+    vecs = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + _NORM_EPS)
     index.add(vecs.astype("float32"))
     faiss.write_index(index, path)
 

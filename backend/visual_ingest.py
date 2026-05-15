@@ -12,8 +12,8 @@ from store import (
 from db import put_cached_captions
 import re
 from pathlib import Path
-from ingest import extract_audio
-from utils_unified import YT_ID_RE
+from pipeline import extract_audio
+from utils import YT_ID_RE
 
 MEDIA = os.path.join(DATA, "media")
 FRAMES = os.path.join(DATA, "frames")
@@ -25,7 +25,7 @@ def _has_video_stream(path: str) -> bool:
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=codec_type",
             "-of", "csv=p=0", path
-        ]).decode().strip()
+        ], timeout=30).decode().strip()
         return out == "video"
     except Exception:
         return False
@@ -35,7 +35,7 @@ def ytdlp_video(url: str, out_mp4: str):
         return  # already downloaded and valid
     if os.path.exists(out_mp4):
         os.remove(out_mp4)
-    from ingest import _ytdlp_auth_args
+    from pipeline import _ytdlp_auth_args
     subprocess.check_call([
         "yt-dlp", "-f", "bv*+ba/b", "--merge-output-format", "mp4",
         "-o", out_mp4, *_ytdlp_auth_args(), url
@@ -58,7 +58,7 @@ def sample_frames(video_path: str, out_dir: str,
     probe = subprocess.check_output([
         "ffprobe","-v","error","-show_entries","format=duration",
         "-of","default=noprint_wrappers=1:nokey=1", video_path
-    ]).decode().strip()
+    ], timeout=30).decode().strip()
     duration = float(probe) if probe else 0.0
 
     ts_path = os.path.join(out_dir, "_frames_ts.txt")
@@ -81,7 +81,7 @@ def sample_frames(video_path: str, out_dir: str,
         "-fps_mode", "vfr",
         "-q:v", "3",
         os.path.join(out_dir, "frame-%06d.jpg")
-    ])
+    ], timeout=300)
 
     # Parse per-frame pts_time and scene score from the metadata sidecar.
     # Format: "frame:N pts:P pts_time:T" followed by "lavfi.scene_score=S"
@@ -160,8 +160,10 @@ class SigLIPEncoder:
         results = []
         for i in range(0, total, batch_size):
             batch_paths = paths[i:i + batch_size]
-            imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+            imgs = []
             try:
+                for p in batch_paths:
+                    imgs.append(Image.open(p).convert("RGB"))
                 inputs = self.processor(images=imgs, return_tensors="pt",
                                         padding="max_length").to(self._device)
                 with torch.no_grad():
@@ -495,8 +497,12 @@ def ingest_visual(url_or_path: str, max_gap_sec: float = 2.0, scene_thresh: floa
             if progress_cb: progress_cb(f"Captioning {done}/{total_scene} scene frames (Moondream2)…")
             if (rank + 1) % 5 == 0 or rank + 1 == len(remaining):
                 print(f"  captioned {done}/{total_scene} scene frames")
-                with open(_ckpt_path, "w") as _f:
-                    json.dump(scene_captions, _f)
+                import tempfile
+                _ckpt_dir_tmp = os.path.dirname(_ckpt_path)
+                with tempfile.NamedTemporaryFile("w", delete=False, dir=_ckpt_dir_tmp, suffix=".tmp") as _tf:
+                    json.dump(scene_captions, _tf)
+                    _tmp_path = _tf.name
+                os.replace(_tmp_path, _ckpt_path)
     else:
         print(f"All {total_scene} scene captions loaded from checkpoint")
 

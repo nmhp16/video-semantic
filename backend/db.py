@@ -29,7 +29,7 @@ def init_db() -> None:
     """)
     try:
         conn.execute("ALTER TABLE visual_chunks ADD COLUMN caption TEXT")
-    except Exception:
+    except sqlite3.OperationalError:
         pass
 
     conn.execute("""
@@ -41,7 +41,7 @@ def init_db() -> None:
     """)
     try:
         conn.execute("ALTER TABLE visual_clips ADD COLUMN caption TEXT")
-    except Exception:
+    except sqlite3.OperationalError:
         pass
 
     conn.execute("""
@@ -75,9 +75,13 @@ def db():
         conn.close()
 
 
+_CLEAR_TABLES = {"chunks", "visual_chunks", "visual_clips", "video_context", "caption_cache"}
+
 def clear_video(video_id: str) -> dict:
     with db() as conn:
         for table in ("chunks", "visual_chunks", "visual_clips", "video_context", "caption_cache"):
+            if table not in _CLEAR_TABLES:
+                raise ValueError(f"Invalid table name: {table!r}")
             conn.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
         conn.commit()
 

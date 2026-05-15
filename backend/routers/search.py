@@ -1,4 +1,4 @@
-import os, json, logging, re
+import os, json, logging, re, threading
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from models import (
@@ -6,12 +6,12 @@ from models import (
     UnifiedSearchHit, UnifiedSearchResponse, ScoreRange, MAX_K,
 
 )
-from indexes import (
+from index_store import (
     load_index, load_siglip_visual_index,
     load_xclip_action_index, has_xclip_action_index,
 )
 from db import get_cached_captions
-from context import filter_videos_by_context
+from video_context import filter_videos_by_context
 from embeddings import get_emb
 
 router = APIRouter()
@@ -22,25 +22,30 @@ _indexes_dir = os.path.join(BASE, "data", "indexes")
 _frames_dir  = os.path.join(BASE, "data", "frames")
 
 _SIGLIP = None
+_siglip_lock = threading.Lock()
 def _get_siglip():
     global _SIGLIP
     if _SIGLIP is None:
-        from visual_ingest import SigLIPEncoder
-        _SIGLIP = SigLIPEncoder()
+        with _siglip_lock:
+            if _SIGLIP is None:
+                from visual_ingest import SigLIPEncoder
+                _SIGLIP = SigLIPEncoder()
     return _SIGLIP
 
 def _build_siglip_query_vector(q: str):
-    import numpy as np
     vec = _get_siglip().encode_text([q])
     return vec.reshape(1, -1).astype("float32")
 
 
 _XCLIP = None
+_xclip_lock = threading.Lock()
 def _get_xclip():
     global _XCLIP
     if _XCLIP is None:
-        from visual_ingest import XCLIPEncoder
-        _XCLIP = XCLIPEncoder()
+        with _xclip_lock:
+            if _XCLIP is None:
+                from visual_ingest import XCLIPEncoder
+                _XCLIP = XCLIPEncoder()
     return _XCLIP
 
 
@@ -176,12 +181,14 @@ def _score_range(hits: list) -> ScoreRange:
 
 
 _VISUAL_MIN_SCORE: float = 0.18  # below this, X-CLIP scores are noise
+_SCORE_THRESHOLD: float = 0.18
+_CAPTION_MATCH_THRESHOLD: float = 0.50
 
 _STOPWORDS = {"a","an","the","is","are","was","were","in","on","at","of","and","or",
               "to","with","for","this","that","it","its","be","by","as","from"}
 
 def _caption_evidence_filter(hits: list, q: str,
-                             strict_min: float = 0.50) -> list:
+                             strict_min: float = _CAPTION_MATCH_THRESHOLD) -> list:
     """Keep only hits whose caption/objects mention a query token.
 
     Called when YOLO found no object match for the query in a video. Without
@@ -303,7 +310,7 @@ def _all_vids_with_visual_chunks(restrict: Optional[list]) -> list:
 def search_auto_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
     vis_vids = set(_globally(".svfaiss", restrict_videos))
     act_vids = set(_globally(".xaclip.faiss", restrict_videos))
-    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=_SCORE_THRESHOLD)
     # FAISS search: only videos that passed context filter (or all indexed if no filter hit)
     faiss_vids = set(candidates) if candidates else (vis_vids | act_vids)
     qv = _build_query_vector(q)             # X-CLIP for action clips
@@ -419,7 +426,7 @@ def search_action_single(video_id: str, q: str, k: int, filter_objects: Optional
 
 
 def search_text_global(q: str, k: int, restrict_videos=None) -> list:
-    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=_SCORE_THRESHOLD)
     vids = candidates if candidates else _globally(".faiss", restrict_videos)
     all_hits = []
     for vid in vids:
@@ -432,7 +439,7 @@ def search_text_global(q: str, k: int, restrict_videos=None) -> list:
 
 
 def search_visual_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
-    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=_SCORE_THRESHOLD)
     vids = candidates if candidates else _globally(".svfaiss", restrict_videos)
     qv = _build_siglip_query_vector(q)
     all_hits = []
@@ -447,7 +454,7 @@ def search_visual_global(q: str, k: int, filter_objects=None, restrict_videos=No
 
 def search_action_global(q: str, k: int, filter_objects=None, restrict_videos=None) -> list:
     xclip_vids = set(_globally(".xaclip.faiss", restrict_videos))
-    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=0.18)
+    candidates = filter_videos_by_context(q, restrict_videos, topn=100, min_cos=_SCORE_THRESHOLD)
     vids = [v for v in candidates if v in xclip_vids] if candidates else list(xclip_vids)
     qv = _build_query_vector(q)
     all_hits = []
@@ -477,7 +484,7 @@ def asearch_all(q: str = Query(...), k: int = Query(50, ge=1, le=MAX_K),
 
 @router.post("/query", response_model=UnifiedSearchResponse)
 def unified_query(body: UnifiedSearchRequest):
-    from utils_unified import extract_video_id
+    from utils import extract_video_id
     scope = (body.scope or "video").lower()
     restrict = body.videos
 
@@ -492,7 +499,7 @@ def unified_query(body: UnifiedSearchRequest):
             need_action=body.mode == "action",
             need_auto=body.mode == "auto",
         ):
-            from ingest import ingest as do_ingest
+            from pipeline import ingest as do_ingest
             from visual_ingest import ingest_visual as do_visual
             if body.mode == "text":
                 do_ingest(body.video_url or "")

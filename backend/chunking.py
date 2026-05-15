@@ -1,6 +1,4 @@
-from typing import List, Dict
-
-def chunk_segments(segments: List[Dict], max_sec=20, stride_sec=5):
+def chunk_segments(segments: list[dict], max_sec: float = 20, stride_sec: float = 5) -> list[dict]:
     chunks = []
     i = 0
     while i < len(segments):

@@ -5,7 +5,7 @@ logging.basicConfig(level=logging.INFO)
 
 def main():
     if len(sys.argv) != 4:
-        print("Usage: ingest_worker.py <status_file> <url> <video_id>", file=sys.stderr)
+        print("Usage: worker.py <status_file> <url> <video_id>", file=sys.stderr)
         sys.exit(1)
 
     status_file, url, video_id = sys.argv[1], sys.argv[2], sys.argv[3]

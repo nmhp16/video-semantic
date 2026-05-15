@@ -1,10 +1,12 @@
-import os, json, subprocess, re
+import os, json, subprocess, re, logging
 from pathlib import Path
 import numpy as np
 from chunking import chunk_segments
 from store import DATA, save_index
 from embeddings import get_emb
-from utils_unified import YT_ID_RE
+from utils import YT_ID_RE
+
+logger = logging.getLogger(__name__)
 
 MEDIA = os.path.join(DATA, "media")
 TRANS = os.path.join(DATA, "transcripts")
@@ -23,14 +25,15 @@ def _ytdlp_auth_args() -> list[str]:
     if cookies_file:
         args += ["--cookies", cookies_file]
     if args:
-        print(f"[yt-dlp auth] forwarding: {' '.join(args)}")
+        logger.debug("[yt-dlp auth] forwarding: %s", " ".join(args))
     else:
-        print("[yt-dlp auth] no cookies configured (YTDLP_COOKIES_FROM_BROWSER / YTDLP_COOKIES unset)")
+        logger.debug("[yt-dlp auth] no cookies configured (YTDLP_COOKIES_FROM_BROWSER / YTDLP_COOKIES unset)")
     return args
 
 def ytdlp(url: str, out: str):
     subprocess.check_call(
-        ["yt-dlp", "-f", "bestaudio/best", "-o", out, *_ytdlp_auth_args(), url]
+        ["yt-dlp", "-f", "bestaudio/best", "-o", out, *_ytdlp_auth_args(), url],
+        timeout=120,
     )
 
 def extract_audio(infile: str, outfile: str):

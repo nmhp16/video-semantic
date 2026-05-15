@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from models import VideoIngestRequest
-from utils_unified import extract_video_id as _parse_video_id
+from utils import extract_video_id as _parse_video_id
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -20,7 +20,8 @@ _JOB_TTL = 3600
 # (X-CLIP, SentenceTransformer) — avoids shared-MPS OOM crashes on macOS.
 _job_queue: queue.Queue = queue.Queue()
 _worker_thread: Optional[threading.Thread] = None
-_WORKER_SCRIPT = os.path.join(BASE, "ingest_worker.py")
+_WORKER_SCRIPT = os.path.join(BASE, "worker.py")
+_WAV_WAIT_TIMEOUT = 180
 
 
 def _worker_loop():
@@ -48,7 +49,12 @@ def _worker_loop():
             [sys.executable, _WORKER_SCRIPT, status_file, url, video_id],
             cwd=BASE, env=env,
         )
-        proc.wait()
+        try:
+            proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            wlog.error("Job timed out, process killed: %s", video_id)
+            raise
         wlog.info("Job done: %s (exit=%d)", video_id, proc.returncode)
 
 
@@ -139,10 +145,10 @@ def _run_ingest_proc(status_file: str, url: str, video_id: str):
         def _run_audio():
             try:
                 import time as _time
-                deadline = _time.monotonic() + 180
+                deadline = _time.monotonic() + _WAV_WAIT_TIMEOUT
                 while not _os.path.exists(wav_path) and _time.monotonic() < deadline:
                     _time.sleep(1)
-                from ingest import ingest
+                from pipeline import pipeline
                 ingest(url)
             except Exception as e:
                 audio_exc.append(e)
@@ -160,7 +166,7 @@ def _run_ingest_proc(status_file: str, url: str, video_id: str):
             raise audio_exc[0]
 
         _write_status(status_file, "running", "Building search index…")
-        from context import build_video_context
+        from video_context import build_video_context
         build_video_context(video_id)
 
         if title or source_url:
@@ -295,7 +301,7 @@ async def ingest_status(job_id: str):
 @router.post("/build_contexts")
 async def rebuild_video_contexts(video_ids: Optional[List[str]] = None):
     from db import db
-    from context import build_video_context
+    from video_context import build_video_context
     if video_ids is None:
         with db() as conn:
             rows = conn.execute("""

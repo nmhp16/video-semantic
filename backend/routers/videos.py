@@ -2,7 +2,7 @@ import os, json, logging
 from fastapi import APIRouter, HTTPException, Path
 from typing import Optional, List
 from db import clear_video
-from indexes import evict_video
+from index_store import evict_video
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

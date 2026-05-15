@@ -1,4 +1,6 @@
-import os, logging
+import os
+import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -6,7 +8,31 @@ from db import init_db
 from routers import search, ingest, videos
 
 logging.basicConfig(level=logging.INFO)
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    from routers.ingest import start_worker
+    start_worker()
+    import threading
+    def _warm():
+        log = logging.getLogger(__name__)
+        try:
+            from routers.search import _get_xclip
+            _get_xclip()
+            log.info("X-CLIP ready")
+        except Exception:
+            log.exception("X-CLIP pre-warm failed")
+        try:
+            from embeddings import get_emb
+            get_emb()
+            log.info("SentenceTransformer ready")
+        except Exception:
+            log.exception("SentenceTransformer pre-warm failed")
+    threading.Thread(target=_warm, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 _cors_raw = os.environ.get("CORS_ORIGINS", "").strip()
 if _cors_raw:
@@ -36,24 +62,3 @@ app.include_router(ingest.router)
 app.include_router(videos.router)
 
 
-@app.on_event("startup")
-async def startup():
-    init_db()
-    from routers.ingest import start_worker
-    start_worker()
-    import threading
-    def _warm():
-        log = logging.getLogger(__name__)
-        try:
-            from routers.search import _get_xclip
-            _get_xclip()
-            log.info("X-CLIP ready")
-        except Exception:
-            log.exception("X-CLIP pre-warm failed")
-        try:
-            from embeddings import get_emb
-            get_emb()
-            log.info("SentenceTransformer ready")
-        except Exception:
-            log.exception("SentenceTransformer pre-warm failed")
-    threading.Thread(target=_warm, daemon=True).start()
